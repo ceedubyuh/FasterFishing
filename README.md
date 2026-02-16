@@ -1,7 +1,7 @@
 # FasterFishing
 
 ## FasterFishing is a Python GUI tool for “goldfishing” Magic: The Gathering Commander decks.
-## It lets you import a decklist, automatically categorize cards, and run simulations to analyze opening hands and early-game performance.
+* It lets you import a decklist, automatically categorize cards, and run simulations to analyze opening hands and early-game performance.
 
 ### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games.
 
