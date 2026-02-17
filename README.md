@@ -52,8 +52,8 @@ cd FasterFishing
 
 2. Install dependencies:
 
-```pip install requests Pillow```
-```pip install cloudscraper```
+* ```pip install requests Pillow```
+* ```pip install cloudscraper```
 
 ### Usage
 
