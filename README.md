@@ -7,7 +7,7 @@
 
 ### Features:
 * Import decks from popular sites:
-  * Moxfield (WIP because their API is not public)
+  * Moxfield 
   * Archidekt
   * MTGGoldfish
 
