@@ -27,17 +27,27 @@
   * Monte Carlo hand analysis
   * Mulligan scenarios
   * Keepable hand percentages
+  * Calculates your manabase using Frank Karnsten's Mana Curve
+    * Suggests what colors and sources your deck needs to improve
  
 * Turn-by-turn goldfish simulation
   * Tracks resource development
   * Estimates average commander cast turn
+  * Estimates average board state per turn
+  * Estimates average damage presented on board and what turn you can go for a win on
+  * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw, tutors and graveyard recursion
+  * Estimates the average turn you can execute any combos your deck includes
 
 * Sample hand viewer
   * Displays opening hands with card images
   * Mulligan options built in
 
 * Scryfall image integration
-  *Automatically downloads and caches card art
+  * Automatically downloads and caches card art
+ 
+* All-in-One deck builder
+  * Edit your deck using Scryfall card searching and EDHREC implemented API to see suggesting cards
+  * See combos listed from CommanderSpellbook and what cards you need to add to finish a combo
 
 ### Requirements
 * Python 3.9+
@@ -90,13 +100,6 @@ You can also use:
 * Cards are categorized using Scryfall’s otag: system.
 * Simulations run thousands of randomized hands to produce statistical results.
 
-### Roadmap / Ideas
-* Save and load deck profiles
-* Custom category definitions
-* Mana curve visualization
-* Advanced mulligan logic
-* Advanced logic to factor in deck manipulation like Draw, Scry/Surveil, Tutors, Cascade/Discover and how it affects simulations
-* EDHREC and CommanderSpellbook integration to find combos and simulate how often they are found
   * Implementing recommended cards from EDHREC in app
 
 ### Disclaimer
