@@ -3,7 +3,8 @@
 ## FasterFishing is a Python GUI tool for “goldfishing” Magic: The Gathering Commander decks.
 * It lets you import a decklist, automatically categorize cards, and run simulations to analyze opening hands and early-game performance.
 
-### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games.
+### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games or manually Goldfish your deck to oblivion. Using reliable math, you can get quick, quantifiable data about your deck without all the hassle.
+### The idea isn't to make a simulator that is 100% accurate because the RNG in a 4-player format is nigh impossible to account for, but have a mathematical breakdown of your cards you can use to find tune a list to perform the way you like it.
 
 ### Features:
 * Import decks from popular sites:
@@ -89,18 +90,10 @@ Deck
 1 Island
 1 Forest
 
-You can also use:
-
-1 Sol Ring
-1 Command Tower
-1 Cultivate #CMDR
-
 ### How It Works
 * Decklists are parsed and card data is fetched from Scryfall.
 * Cards are categorized using Scryfall’s otag: system.
 * Simulations run thousands of randomized hands to produce statistical results.
-
-  * Implementing recommended cards from EDHREC in app
 
 ### Disclaimer
 This is a fan-made tool for deck analysis and is not affiliated with Wizards of the Coast.
