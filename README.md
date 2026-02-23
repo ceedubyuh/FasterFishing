@@ -7,7 +7,7 @@
 
 ### Features:
 * Import decks from popular sites:
-  * Moxfield (WIP because their API is not public)
+  * Moxfield 
   * Archidekt
   * MTGGoldfish
 
@@ -52,7 +52,8 @@ cd FasterFishing
 
 2. Install dependencies:
 
-```pip install requests Pillow```
+* ```pip install requests Pillow```
+* ```pip install cloudscraper```
 
 ### Usage
 
