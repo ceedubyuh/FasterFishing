@@ -4,7 +4,7 @@
 * It lets you import a decklist, automatically categorize cards, and run simulations to analyze opening hands and early-game performance.
 
 ### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games or manually Goldfish your deck to oblivion. Using reliable math, you can get quick, quantifiable data about your deck without all the hassle.
-### The idea isn't to make a simulator that is 100% accurate because the RNG in a 4-player format is nigh impossible to account for, but have a mathematical breakdown of your cards you can use to find tune a list to perform the way you like it.
+### The idea isn't to make a simulator that is 100% accurate because the RNG in a 4-player format is nigh impossible to account for, but have a mathematical breakdown of your cards you can use to fine tune a list to perform the way you like it and statistically improve the list in ways you would have trouble doing manually.
 
 ### Features:
 * Import decks from popular sites:
