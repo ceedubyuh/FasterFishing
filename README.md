@@ -3,7 +3,8 @@
 ## FasterFishing is a Python GUI tool for “goldfishing” Magic: The Gathering Commander decks.
 * It lets you import a decklist, automatically categorize cards, and run simulations to analyze opening hands and early-game performance.
 
-### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games.
+### The goal is to quickly test consistency, ramp density, and land counts without needing to play full games or manually Goldfish your deck to oblivion. Using reliable math, you can get quick, quantifiable data about your deck without all the hassle.
+### The idea isn't to make a simulator that creates an impervious deck, because the RNG in a 4-player format is nigh impossible to account for, but have a mathematical breakdown of your cards you can use to fine tune a list to perform the way you like it and statistically improve the list in ways you would have trouble doing manually.
 
 ### Features:
 * Import decks from popular sites:
@@ -27,17 +28,27 @@
   * Monte Carlo hand analysis
   * Mulligan scenarios
   * Keepable hand percentages
+  * Calculates your manabase using Frank Karnsten's Mana Curve
+    * Suggests what colors and sources your deck needs to improve
  
 * Turn-by-turn goldfish simulation
   * Tracks resource development
   * Estimates average commander cast turn
+  * Estimates average board state per turn
+  * Estimates average damage presented on board and what turn you can go for a win on
+  * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw, tutors and graveyard recursion
+  * Estimates the average turn you can execute any combos your deck includes
 
 * Sample hand viewer
   * Displays opening hands with card images
   * Mulligan options built in
 
 * Scryfall image integration
-  *Automatically downloads and caches card art
+  * Automatically downloads and caches card art
+ 
+* All-in-One deck builder
+  * Edit your deck using Scryfall card searching and EDHREC implemented API to see suggesting cards
+  * See combos listed from CommanderSpellbook and what cards you need to add to finish a combo
 
 ### Requirements
 * Python 3.9+
@@ -79,25 +90,10 @@ Deck
 1 Island
 1 Forest
 
-You can also use:
-
-1 Sol Ring
-1 Command Tower
-1 Cultivate #CMDR
-
 ### How It Works
 * Decklists are parsed and card data is fetched from Scryfall.
 * Cards are categorized using Scryfall’s otag: system.
 * Simulations run thousands of randomized hands to produce statistical results.
-
-### Roadmap / Ideas
-* Save and load deck profiles
-* Custom category definitions
-* Mana curve visualization
-* Advanced mulligan logic
-* Advanced logic to factor in deck manipulation like Draw, Scry/Surveil, Tutors, Cascade/Discover and how it affects simulations
-* EDHREC and CommanderSpellbook integration to find combos and simulate how often they are found
-  * Implementing recommended cards from EDHREC in app
 
 ### Disclaimer
 This is a fan-made tool for deck analysis and is not affiliated with Wizards of the Coast.
