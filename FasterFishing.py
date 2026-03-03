@@ -1379,6 +1379,9 @@ class SimEngine:
         cumul_damage = {t: 0 for t in range(turns+1)}       # cumulative combat damage dealt
         cards_drawn_this_turn = {t: 0 for t in range(turns+1)}  # cards drawn THIS turn
         gy_size = {t: 0 for t in range(turns+1)}             # graveyard size
+        removal_cast = {t: 0 for t in range(turns+1)}       # cumulative removal effects used
+        removal_available = {t: 0 for t in range(turns+1)}  # removal cards in hand + ETB removal on bf
+        removal_drawn = {t: 0 for t in range(turns+1)}      # cumulative removal cards drawn (in hand + cast + GY)
 
         # Pre-compute draw estimates for each unique card
         draw_cache = {}
@@ -1821,7 +1824,12 @@ class SimEngine:
             m_ddmg = re.search(r'whenever\s+(?:\w+[^.]*?\s+)?deals\s+(?:combat\s+)?damage\s+(?:to\s+(?:a\s+)?(?:player|opponent))?', oracle)
             if m_ddmg:
                 action_text = oracle[m_ddmg.end():]
-                _detect_actions(action_text, triggers, "damage_dealt", "creature")
+                # Distinguish per-creature ("a creature you control") vs per-self
+                ddmg_prefix = oracle[:m_ddmg.end()]
+                if re.search(r'(?:a|another)\s+creature\s+(?:you\s+control\s+)?deals', ddmg_prefix):
+                    _detect_actions(action_text, triggers, "damage_dealt", "each_creature")
+                else:
+                    _detect_actions(action_text, triggers, "damage_dealt", "self")
 
             # ═══════════════════════════════════════
             # LEAVE-THE-BATTLEFIELD TRIGGERS
@@ -2520,6 +2528,280 @@ class SimEngine:
                     m2 = re.search(r'(?:other\s+)?creatures\s+you\s+control\s+(?:get|have)\s+\+(\d+)/\+(\d+)', oracle)
                     if m2: anthem_cache[c.name] = int(m2.group(1))
 
+        # ---- SPELL COPY / STORM / SPELLSLINGER DETECTION ----
+        # Detects cards whose effects multiply when cast. All detection is
+        # purely from oracle text — no card-specific functions.
+        #
+        # storm_cards:      set of spell names with the "storm" keyword
+        # cascade_cards:    set of spell names with the "cascade" keyword
+        # spell_copy_cache: permanent_name -> (copy_type, once, spell_filter)
+        #   copy_type: "per_creature" | "flat" | "scaling"
+        #   once:      True = first spell each turn only (Double Vision, Kalamax)
+        #   spell_filter: "any" | "instant_sorcery" | "instant" | "noncreature" | "targeting"
+        # feather_cache:    set of permanent names that return targeting I/S to hand
+        # firebending_cache: permanent_name -> mana_amount (attack mana)
+        # casualty_cards:   spell_name -> casualty_power (sacrifice N power → copy)
+        # conspire_cards:   set of spell names with conspire keyword
+        storm_cards = set()
+        cascade_cards = set()
+        spell_copy_cache = {}
+        feather_cache = set()
+        firebending_cache = {}
+        casualty_cards = {}
+        conspire_cards = set()
+        all_copy_check = list(cards) + (commanders or [])
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            is_spell = "instant" in tl or "sorcery" in tl
+
+            # ---- Keywords on spells themselves ----
+            if is_spell:
+                if re.search(r'\bstorm\b', oracle):
+                    storm_cards.add(c.name)
+                if re.search(r'\bcascade\b', oracle):
+                    cascade_cards.add(c.name)
+                cas_m = re.search(r'\bcasualty\s+(\d+)', oracle)
+                if cas_m:
+                    casualty_cards[c.name] = int(cas_m.group(1))
+                if re.search(r'\bconspire\b', oracle):
+                    conspire_cards.add(c.name)
+                continue  # spells don't go in spell_copy_cache (that's for permanents)
+
+            # ---- Permanents that copy spells ----
+            # Also detect cascade on permanent spells (creatures with cascade)
+            if re.search(r'\bcascade\b', oracle):
+                cascade_cards.add(c.name)
+
+            # Firebending N: "whenever this creature attacks, add {R}*N"
+            fire_m = re.search(r'firebending\s+(\d+)', oracle)
+            if fire_m:
+                firebending_cache[c.name] = int(fire_m.group(1))
+
+            # Feather-style: return targeting instants/sorceries to hand
+            if re.search(r'(?:exile|return)\s+(?:it|that\s+(?:card|spell))', oracle):
+                if re.search(r'(?:instant|sorcery|noncreature\s+spell)', oracle):
+                    if re.search(r'(?:end\s+step|beginning|your\s+hand)', oracle):
+                        feather_cache.add(c.name)
+                        continue
+
+            # ---- Generic spell copy detection ----
+            # Look for "copy" near "spell" in a cast-trigger context
+            has_copy = bool(re.search(
+                r'cop(?:y|ies)\s+(?:that\s+spell|it|that\s+card)', oracle))
+            if not has_copy:
+                has_copy = bool(re.search(r'you\s+may\s+copy', oracle))
+            if not has_copy:
+                # "copy [number] of" pattern or other copy mentions near "cast"
+                has_copy = bool(re.search(r'cast.*?cop(?:y|ies)', oracle)
+                                or re.search(r'cop(?:y|ies).*?spell', oracle))
+            if not has_copy:
+                # Magecraft / trigger-doubling (Veyran-style)
+                if re.search(r'(?:magecraft|instant\s+or\s+sorcery).*?triggers?\s+(?:an?\s+)?additional\s+time', oracle):
+                    spell_copy_cache[c.name] = ("flat", False, "instant_sorcery")
+                    continue
+                # Harmonic Prodigy: triggered abilities trigger additional time
+                if re.search(r'triggered\s+abilit(?:y|ies).*?trigger\s+(?:an?\s+)?additional\s+time', oracle):
+                    spell_copy_cache[c.name] = ("flat", False, "instant_sorcery")
+                    continue
+                continue  # no copy pattern found
+
+            # ---- Determine copy_type ----
+            # Per-creature: "copy for each [other] creature"
+            if re.search(r'cop(?:y|ies)\s+(?:that\s+spell|it)\s+for\s+each\s+(?:other\s+)?creature', oracle):
+                copy_type = "per_creature"
+            # Scaling: "copy for each [other] instant/sorcery/spell you've cast"
+            elif re.search(r'cop(?:y|ies)\s+(?:that\s+spell|it)\s+for\s+each\s+(?:other\s+)?(?:instant|sorcery|spell)', oracle):
+                copy_type = "scaling"
+            else:
+                copy_type = "flat"
+
+            # ---- Determine once-per-turn ----
+            once = bool(re.search(
+                r'(?:first|next)\s+(?:instant|sorcery|spell).*?(?:each|per)\s+turn', oracle)
+                or re.search(r'(?:your|the)\s+first\s+(?:instant|sorcery|spell)', oracle))
+
+            # ---- Determine spell_filter ----
+            # What types of spells does this copy?
+            # Check most restrictive first, fall back to broadest
+            if re.search(r'cop(?:y|ies)\s+(?:that\s+spell|it)\s+for\s+each\s+(?:other\s+)?creature', oracle):
+                # Zada/Mirrorwing: only targets single-target spells
+                spell_filter = "targeting"
+            elif re.search(r'(?:an?\s+)?instant\s+spell[^.]*?cop(?:y|ies)', oracle):
+                spell_filter = "instant"
+            elif re.search(r'(?:an?\s+)?instant\s+or\s+sorcery\s+spell[^.]*?cop(?:y|ies)', oracle):
+                spell_filter = "instant_sorcery"
+            elif re.search(r'cop(?:y|ies)[^.]*?instant\s+or\s+sorcery', oracle):
+                spell_filter = "instant_sorcery"
+            elif re.search(r'(?:an?\s+)?noncreature\s+spell[^.]*?cop(?:y|ies)', oracle):
+                spell_filter = "noncreature"
+            elif re.search(r'whenever\s+you\s+cast\s+(?:a|an)\s+(?:instant|sorcery)\s+(?:or\s+sorcery\s+)?spell', oracle):
+                spell_filter = "instant_sorcery"
+            elif re.search(r'whenever\s+you\s+cast\s+(?:a|an)\s+instant\s+spell', oracle):
+                spell_filter = "instant"
+            else:
+                # Broadest: "whenever you cast a spell" / no type restriction
+                spell_filter = "any"
+
+            spell_copy_cache[c.name] = (copy_type, once, spell_filter)
+
+        # ---- COST REDUCTION DETECTION ----
+        # cost_reduction_cache: card_name -> (amount, spell_filter)
+        cost_reduction_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" in tl or "sorcery" in tl:
+                continue  # only permanents reduce costs
+            m = re.search(r'instant\s+(?:and|or)\s+sorcery\s+spells?\s+you\s+cast\s+cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                cost_reduction_cache[c.name] = (int(m.group(1)), "instant_sorcery"); continue
+            m = re.search(r'creature\s+spells?\s+you\s+cast\s+cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                cost_reduction_cache[c.name] = (int(m.group(1)), "creature"); continue
+            m = re.search(r'artifact\s+spells?\s+you\s+cast\s+cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                cost_reduction_cache[c.name] = (int(m.group(1)), "artifact"); continue
+            m = re.search(r'noncreature\s+spells?\s+you\s+cast\s+cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                cost_reduction_cache[c.name] = (int(m.group(1)), "noncreature"); continue
+            m = re.search(r'spells?\s+you\s+cast\s+cost\s+\{(\d+)\}\s+less', oracle)
+            if m and "spells your opponents cast" not in oracle:
+                cost_reduction_cache[c.name] = (int(m.group(1)), "any"); continue
+
+        # ---- EQUIPMENT DETECTION ----
+        equip_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "equipment" not in tl:
+                continue
+            m = re.search(r'equipped\s+creature\s+gets?\s+\+(\d+)/[+\-]\d+', oracle)
+            if m:
+                equip_cache[c.name] = int(m.group(1))
+
+        # ---- TREASURE CREATION DETECTION ----
+        treasure_create_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            if "treasure" not in oracle:
+                continue
+            tl = (c.type_line or "").lower()
+            if "instant" in tl or "sorcery" in tl:
+                continue
+            nw_map = {"a":1,"an":1,"one":1,"two":2,"three":3,"four":4,"five":5}
+            if re.search(r'enters[^.]*?create\s+\w+\s+treasure', oracle):
+                m2 = re.search(r'create\s+(\w+)\s+treasure', oracle)
+                w = m2.group(1) if m2 else "a"
+                treasure_create_cache[c.name] = ("etb", nw_map.get(w, int(w) if w.isdigit() else 1))
+            elif re.search(r'whenever\s+you\s+cast\s+(?:a|an)\s+\w*\s*spell[^.]*?treasure', oracle):
+                treasure_create_cache[c.name] = ("cast", 1)
+            elif re.search(r'whenever\s+an?\s+opponent', oracle) and "treasure" in oracle:
+                treasure_create_cache[c.name] = ("opponent_cast", 1)
+            elif re.search(r'(?:beginning|upkeep)[^.]*?treasure', oracle):
+                treasure_create_cache[c.name] = ("upkeep", 1)
+            elif re.search(r'whenever\s+(?:a|another)\s+creature[^.]*?dies[^.]*?treasure', oracle):
+                treasure_create_cache[c.name] = ("death", 1)
+            elif re.search(r'(?:landfall|whenever\s+a\s+land)[^.]*?treasure', oracle):
+                treasure_create_cache[c.name] = ("landfall", 1)
+            elif re.search(r'deals\s+(?:combat\s+)?damage[^.]*?treasure', oracle):
+                treasure_create_cache[c.name] = ("combat_damage", 1)
+
+        # ---- MONARCH / INITIATIVE DETECTION ----
+        monarch_cards = set()
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            if "you become the monarch" in oracle or "you take the initiative" in oracle:
+                monarch_cards.add(c.name)
+
+        # ---- FLASHBACK / GRAVEYARD CAST DETECTION ----
+        flashback_cache = {}
+        for c in cards:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            if re.search(r'\b(?:flashback|jump-start|retrace)\b', oracle):
+                m2 = re.search(r'flashback\s+\{([^}]*)\}', oracle)
+                if m2:
+                    cost_str = m2.group(1)
+                    nums = re.findall(r'(\d+)', cost_str)
+                    pips = len(re.findall(r'[wubrgc]', cost_str.lower()))
+                    fb_cost = sum(int(nn) for nn in nums) + pips
+                else:
+                    fb_cost = max(int(c.cmc) + 1, 2)
+                flashback_cache[c.name] = fb_cost
+
+        # ---- WHEEL EFFECT DETECTION ----
+        wheel_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            nw = {"a":1,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7}
+            m2 = re.search(r'(?:each\s+player|you)\s+(?:discards?\s+(?:their|your)\s+hand|shuffles?\s+(?:their|your)\s+hand)[^.]*?draws?\s+(\w+)\s+cards?', oracle)
+            if m2:
+                wheel_cache[c.name] = nw.get(m2.group(1), int(m2.group(1)) if m2.group(1).isdigit() else 7)
+            elif re.search(r'discard\s+(?:your|their)\s+hand.*?draw\s+(?:seven|7)', oracle):
+                wheel_cache[c.name] = 7
+
+        # ---- EXTRA TURN DETECTION ----
+        extra_turn_cards = set()
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            if re.search(r'(?:take|takes?)\s+an?\s+extra\s+turn', oracle):
+                extra_turn_cards.add(c.name)
+            elif re.search(r'extra\s+turn\s+after\s+this\s+one', oracle):
+                extra_turn_cards.add(c.name)
+
+        # ---- PLANESWALKER ABILITY DETECTION ----
+        pw_ability_cache = {}
+        for c in all_copy_check:
+            tl = (c.type_line or "").lower()
+            if "planeswalker" not in tl:
+                continue
+            oracle = (c.oracle_text or "").lower()
+            m_plus = re.search(r'\+(\d+):\s*([^.]*\.)', oracle)
+            if not m_plus:
+                continue
+            plus_cost = int(m_plus.group(1))
+            plus_text = m_plus.group(2)
+            m_loy = re.search(r'loyalty:\s*(\d+)', oracle)
+            loyalty = int(m_loy.group(1)) if m_loy else max(int(c.cmc) - 1, 3)
+            pa = None; pp = 0
+            if "draw" in plus_text:
+                md = re.search(r'draw\s+(\w+)\s+cards?', plus_text)
+                pp = {"a":1,"one":1,"two":2,"three":3}.get(md.group(1), 1) if md else 1
+                pa = "draw"
+            elif "create" in plus_text and "token" in plus_text:
+                mt = re.search(r'create\s+(\w+)\s+', plus_text)
+                pp = {"a":1,"an":1,"one":1,"two":2,"three":3}.get(mt.group(1), 1) if mt else 1
+                pa = "create_token"
+            elif re.search(r'deals?\s+(\d+)\s+damage', plus_text):
+                pp = int(re.search(r'deals?\s+(\d+)\s+damage', plus_text).group(1))
+                pa = "damage"
+            elif "scry" in plus_text or "look" in plus_text:
+                pa = "scry"; pp = 1
+            if pa:
+                pw_ability_cache[c.name] = (loyalty, plus_cost, pa, pp)
+
+        # ---- EXPERIENCE COUNTER DETECTION ----
+        experience_cache = {}
+        if commanders:
+            for c in commanders:
+                oracle = (c.oracle_text or "").lower()
+                if "experience counter" not in oracle:
+                    continue
+                if re.search(r'instant\s+or\s+sorcery.*?experience', oracle):
+                    experience_cache[c.name] = ("cast_is", "cost_reduction")
+                elif re.search(r'creature.*?dies.*?experience', oracle):
+                    experience_cache[c.name] = ("death", "reanimate")
+                elif re.search(r'enchantment.*?experience', oracle):
+                    experience_cache[c.name] = ("cast_enchantment", "token_power")
+                else:
+                    experience_cache[c.name] = ("cast_any", "generic")
+
         for i in range(n):
             sh = random.sample(deck, len(deck))
             hand = list(sh[:7]); lib = list(sh[7:])
@@ -2538,6 +2820,13 @@ class SimEngine:
             sim_self_counter_turns = {}  # card_name -> turns on battlefield (for Darksteel Reactor etc.)
             cmdr_on_battlefield = set()  # track which commanders are on bf
             cmdr_tax = {cn: 0 for cn in cmdr_cmc}  # commander tax (increases by 2 each cast)
+            sim_removal_cast = 0  # cumulative removal spells/effects used this game
+            sim_treasures = 0  # treasure tokens (usable as mana)
+            sim_is_monarch = False  # monarch status (extra draw each turn)
+            sim_experience = 0  # experience counters (Mizzix, Meren, etc.)
+            sim_bonus_turns = 0  # extra turns queued
+            sim_pw_loyalty = {}  # planeswalker_name -> current loyalty
+
 
             cs = Counter(c.category for c in hand)
             for cat in ALL_CATEGORIES: td[0][cat] += cs.get(cat, 0)
@@ -2599,7 +2888,45 @@ class SimEngine:
                             board_bonus_mana += creature_ct
 
                 mana = land_count + ramp_mana + board_bonus_mana
+                # Firebending: creatures that add mana when attacking
+                # In goldfish, creatures always attack, so this mana is always available
+                for bc in battlefield:
+                    if bc.name in firebending_cache:
+                        mana += firebending_cache[bc.name]
+                # Treasure tokens as mana (consumed when spent)
+                mana += sim_treasures
                 spent = 0
+
+                # Cost reduction from permanents on battlefield
+                cost_red_total = 0
+                cost_red_by_type = {}
+                for bc in battlefield:
+                    if bc.name in cost_reduction_cache:
+                        amt, sfilter = cost_reduction_cache[bc.name]
+                        if sfilter == "any":
+                            cost_red_total += amt
+                        else:
+                            cost_red_by_type[sfilter] = cost_red_by_type.get(sfilter, 0) + amt
+                # Experience-based cost reduction (Mizzix)
+                for ecn, (etrig, etype) in experience_cache.items():
+                    if etype == "cost_reduction" and ecn.lower() in cmdr_on_battlefield:
+                        cost_red_by_type["instant_sorcery"] = cost_red_by_type.get("instant_sorcery", 0) + sim_experience
+
+                def effective_cmc(card):
+                    """Card effective CMC after cost reductions."""
+                    base = int(card.cmc)
+                    red = cost_red_total
+                    ctl = (card.type_line or "").lower()
+                    for sf, amt in cost_red_by_type.items():
+                        if sf == "instant_sorcery" and ("instant" in ctl or "sorcery" in ctl):
+                            red += amt
+                        elif sf == "creature" and "creature" in ctl:
+                            red += amt
+                        elif sf == "artifact" and "artifact" in ctl:
+                            red += amt
+                        elif sf == "noncreature" and "creature" not in ctl:
+                            red += amt
+                    return max(base - red, 0)
 
                 # Play land(s) — including extra land drops from Exploration/Azusa
                 extra_land_sources = sum(1 for c in battlefield if c.name in extra_land_cards)
@@ -2632,7 +2959,7 @@ class SimEngine:
                 # ---- SMART CASTING ----
                 # Roll cast decisions once per card this turn
                 cards_to_cast = list(cmdr_cast_this_turn)  # include commanders just cast
-                castable = [c for c in hand if c.category != "Land" and int(c.cmc) <= mana - spent]
+                castable = [c for c in hand if c.category != "Land" and effective_cmc(c) <= mana - spent]
 
                 # Track what's accessible this turn (hand + battlefield + commanders) for combo checks
                 accessible_names = set()
@@ -2722,6 +3049,15 @@ class SimEngine:
 
                     cast_decisions.append((pri, int(card.cmc), card))
 
+                # ---- FLASHBACK / GRAVEYARD CASTING ----
+                for gc in list(graveyard):
+                    if gc.name not in flashback_cache:
+                        continue
+                    fb_cost = flashback_cache[gc.name]
+                    fb_cost = max(fb_cost - cost_red_total, 0)  # apply generic cost reduction
+                    if fb_cost <= mana - spent:
+                        cast_decisions.append((7, fb_cost, gc))  # lower priority than hand cards
+
                 # Sort by priority then CMC (cast cheapest first within priority)
                 # X spells go last (priority 10) so they can use remaining mana
                 for i, (pri, cmc, card) in enumerate(cast_decisions):
@@ -2742,7 +3078,7 @@ class SimEngine:
                         cards_to_cast.append(card)
                         spent += base + x_val  # spend full amount
                     else:
-                        cost = int(card.cmc)
+                        cost = effective_cmc(card)
                         if cost > mana - spent:
                             continue
                         cards_to_cast.append(card)
@@ -2763,6 +3099,7 @@ class SimEngine:
                 lands_entered_this_turn = 0
                 creatures_died_this_turn = 0
                 chain_counters = 0
+                spells_cast_this_turn = 0  # tracks spell count for storm/copy scaling
 
                 def get_etb_tokens(cname):
                     """Get number of tokens a card creates on ETB."""
@@ -2885,6 +3222,8 @@ class SimEngine:
                     nonlocal chain_lifegain, creatures_entered_this_turn
                     nonlocal creatures_died_this_turn, chain_counters
                     nonlocal turn_bonus, draws_this_turn, lands_entered_this_turn
+                    nonlocal sim_removal_cast
+                    nonlocal sim_treasures, sim_experience
 
                     max_chain = 50  # safety cap for total iterations
                     iterations = 0
@@ -2901,7 +3240,6 @@ class SimEngine:
                             tokens_created_this_turn += param
                             creatures_entered_this_turn += param
                             # Tokens entering trigger creature_etb, artifact_etb, token_created, permanent_etb
-                            token_types = {"creature", "artifact"}  # assume creature artifact tokens (conservative)
                             for bp in battlefield:
                                 if bp.name in trigger_cache:
                                     for ev, cond, act2, param2 in trigger_cache[bp.name]:
@@ -2990,6 +3328,9 @@ class SimEngine:
                                 creatures_entered_this_turn += 1
                                 bt_types = get_card_types(best_target)
                                 fire_etb_effects(best_target.name, bt_types, trigger_q, source="card")
+                                # Track ETB removal from blink
+                                if etb_effs.get("removal", 0) > 0:
+                                    sim_removal_cast += 1
 
                         elif act == "counter":
                             chain_counters += param
@@ -3020,8 +3361,13 @@ class SimEngine:
                 # ---- Process each card cast through trigger chain ----
                 for card in cards_to_cast:
                     is_cmdr = card in cmdr_cast_this_turn
+                    is_flashback = (card in graveyard and card.name in flashback_cache)
                     if not is_cmdr:
-                        hand.remove(card)
+                        if is_flashback:
+                            graveyard.remove(card)  # flashback: exile from graveyard
+                        elif card in hand:
+                            hand.remove(card)
+                        # else: card was displaced by wheel/other effect; still cast it
                     tl = (card.type_line or "").lower()
                     is_permanent = "instant" not in tl and "sorcery" not in tl
                     card_types = get_card_types(card)
@@ -3029,11 +3375,19 @@ class SimEngine:
                     if not is_cmdr:
                         if is_permanent:
                             battlefield.append(card)
-                        else:
-                            graveyard.append(card)
+                        elif not is_flashback:
+                            graveyard.append(card)  # normal I/S -> graveyard
+                        # flashback cards are exiled (don't go back to graveyard)
 
                     if "creature" in card_types:
                         creatures_entered_this_turn += 1
+
+                    # ---- REMOVAL TRACKING ----
+                    if card.category in ("Removal", "Board Wipe"):
+                        sim_removal_cast += 1
+                    # ETB removal on a permanent (e.g. Ravenous Chupacabra)
+                    elif is_permanent and etb_value_cache.get(card.name, {}).get("removal", 0) > 0:
+                        sim_removal_cast += 1
 
                     # ---- CLONE / COPY HANDLING ----
                     # If this card is a clone, it copies the best creature on battlefield
@@ -3105,25 +3459,119 @@ class SimEngine:
                         # Other permanents react to this entering
                         fire_etb_effects(card.name, card_types, trigger_queue, source="card")
 
-                    # ---- INSTANT/SORCERY ONE-SHOT EFFECTS ----
+                    # ---- SPELL COPY MULTIPLIER (storm, Zada, Swarm Intelligence, Azula, etc.) ----
+                    # Copies multiply one-shot effects for instants/sorceries,
+                    # and create token copies (extra ETBs) for permanent spells.
+                    spell_mult = 1
+                    card_oracle = (card.oracle_text or "").lower()
+
+                    # Storm: copy for each spell cast before this one (on the spell itself)
+                    if card.name in storm_cards:
+                        spell_mult += spells_cast_this_turn
+
+                    # Casualty: sacrifice creature power >= N to copy (on the spell itself)
+                    # In goldfish, assume we have a creature to sacrifice ~50% of the time
+                    if card.name in casualty_cards:
+                        cas_power = casualty_cards[card.name]
+                        can_casualty = any(
+                            power_cache.get(b.name, 1) >= cas_power
+                            for b in battlefield
+                            if "creature" in (b.type_line or "").lower()
+                        ) or sim_total_tokens >= 1
+                        if can_casualty:
+                            spell_mult += 1
+
+                    # Conspire: tap two untapped creatures that share a color → copy
+                    if card.name in conspire_cards:
+                        cr_on_bf = sum(1 for b in battlefield
+                                       if "creature" in (b.type_line or "").lower())
+                        cr_on_bf += int(sim_total_tokens)
+                        if cr_on_bf >= 2:
+                            spell_mult += 1
+
+                    # Spell-copy permanents on battlefield
+                    is_single_target = bool(re.search(
+                        r'target\s+(?:creature|permanent|artifact|enchantment|player|opponent)',
+                        card_oracle))
+                    for bp in battlefield:
+                        if bp.name not in spell_copy_cache:
+                            continue
+                        ctype, once, sfilter = spell_copy_cache[bp.name]
+
+                        # Check spell_filter match
+                        if sfilter == "targeting" and not is_single_target:
+                            continue
+                        elif sfilter == "instant" and "instant" not in tl:
+                            continue
+                        elif sfilter == "instant_sorcery" and "instant" not in tl and "sorcery" not in tl:
+                            continue
+                        elif sfilter == "noncreature" and "creature" in card_types:
+                            continue
+                        # sfilter == "any" always matches
+
+                        # Check once-per-turn
+                        if once and spells_cast_this_turn > 0:
+                            continue
+
+                        if ctype == "per_creature":
+                            # Zada/Mirrorwing: copy for each OTHER creature
+                            cr_count = sum(1 for b in battlefield
+                                           if "creature" in (b.type_line or "").lower())
+                            cr_count += int(sim_total_tokens)
+                            spell_mult += max(cr_count - 1, 0)
+                        elif ctype == "flat":
+                            spell_mult += 1
+                        elif ctype == "scaling":
+                            # Thousand-Year Storm: copy for each prior I/S this turn
+                            spell_mult += spells_cast_this_turn
+
+                    # ---- APPLY SPELL COPIES TO EFFECTS ----
+                    # For instants/sorceries: multiply one-shot effects
                     if not is_permanent:
                         etb_effs = etb_value_cache.get(card.name, {})
-                        # Tokens
                         etk = resolve_x(etb_effs.get("tokens", 0), card.name)
                         if etk > 0:
-                            trigger_queue.append(("create_token", etk, card.name))
-                        # Damage
+                            trigger_queue.append(("create_token", etk * spell_mult, card.name))
                         edm = resolve_x(etb_effs.get("damage", 0), card.name)
                         if edm > 0:
-                            trigger_queue.append(("damage", edm, card.name))
-                        # Lifegain
+                            trigger_queue.append(("damage", edm * spell_mult, card.name))
                         elg = resolve_x(etb_effs.get("lifegain", 0), card.name)
                         if elg > 0:
-                            trigger_queue.append(("lifegain", elg, card.name))
-                        # Counters
+                            trigger_queue.append(("lifegain", elg * spell_mult, card.name))
                         ec = resolve_x(etb_effs.get("counter", 0), card.name)
                         if ec > 0:
-                            trigger_queue.append(("counter", ec, card.name))
+                            trigger_queue.append(("counter", ec * spell_mult, card.name))
+
+                    # For permanent spells with copies: extra ETBs from token copies
+                    # (e.g. Azula copies a creature spell → token copy with ETB)
+                    elif is_permanent and spell_mult > 1:
+                        extra_copies = spell_mult - 1
+                        if "creature" in card_types:
+                            creatures_entered_this_turn += extra_copies
+                            tokens_created_this_turn += extra_copies
+                        # Each token copy triggers the original's ETB effects
+                        etb_effs = etb_value_cache.get(etb_source, {})
+                        for _ in range(extra_copies):
+                            etk = resolve_x(etb_effs.get("tokens", 0), etb_source)
+                            if etk > 0:
+                                trigger_queue.append(("create_token", etk, etb_source))
+                            ed2 = resolve_x(etb_effs.get("draw", 0), etb_source)
+                            if ed2 > 0:
+                                trigger_queue.append(("draw", ed2, etb_source))
+                            edm2 = resolve_x(etb_effs.get("damage", 0), etb_source)
+                            if edm2 > 0:
+                                trigger_queue.append(("damage", edm2, etb_source))
+                            elg2 = resolve_x(etb_effs.get("lifegain", 0), etb_source)
+                            if elg2 > 0:
+                                trigger_queue.append(("lifegain", elg2, etb_source))
+                            er2 = resolve_x(etb_effs.get("ramp", 0), etb_source)
+                            if er2 > 0:
+                                trigger_queue.append(("ramp", er2, etb_source))
+                            ec2 = resolve_x(etb_effs.get("counter", 0), etb_source)
+                            if ec2 > 0:
+                                trigger_queue.append(("counter", ec2, etb_source))
+                            # Also trigger ETB reactions from other permanents
+                            fire_etb_effects(card.name, card_types, trigger_queue, source="card")
 
                     # ---- RESOLVE ALL TRIGGERS (with chaining) ----
                     resolve_queue(trigger_queue)
@@ -3137,7 +3585,8 @@ class SimEngine:
                         # Half X, rounded down (Hydroid Krasis)
                         draws_n = x_values_this_turn.get(card.name, 3) // 2
                     if draws_n > 0 and not repeating:
-                        actual_draws = int(draws_n)
+                        # Apply spell_mult for instants/sorceries (storm/copy draw more)
+                        actual_draws = int(draws_n) * (spell_mult if not is_permanent else 1)
                         # Skip if already counted via trigger chain ETB
                         if card.name not in etb_token_cache:
                             for _ in range(actual_draws):
@@ -3187,6 +3636,162 @@ class SimEngine:
                             elif tdest == "battlefield": battlefield.append(tutor_target)
                             elif tdest == "graveyard": graveyard.append(tutor_target)
 
+                    # ---- FEATHER RETURN-TO-HAND ----
+                    # If a Feather-style permanent is on bf, single-target instants/sorceries
+                    # return to hand instead of going to graveyard
+                    if not is_permanent and not is_cmdr and feather_cache:
+                        card_oracle = (card.oracle_text or "").lower()
+                        if re.search(r'target\s+creature', card_oracle):
+                            for bp in battlefield:
+                                if bp.name in feather_cache:
+                                    if card in graveyard:
+                                        graveyard.remove(card)
+                                        hand.append(card)
+                                    break
+
+                    # ---- CASCADE ----
+                    # Cascade reveals cards until finding a nonland card with lower CMC,
+                    # then casts it for free. Model as: draw the best low-CMC spell from lib.
+                    if card.name in cascade_cards and lib:
+                        card_cmc_val = int(card.cmc)
+                        cascade_target = None
+                        for lc in lib:
+                            if lc.category != "Land" and int(lc.cmc) < card_cmc_val:
+                                cascade_target = lc
+                                break
+                        if cascade_target:
+                            lib.remove(cascade_target)
+                            ctli = (cascade_target.type_line or "").lower()
+                            is_perm = "instant" not in ctli and "sorcery" not in ctli
+                            if is_perm:
+                                battlefield.append(cascade_target)
+                                ct_types = get_card_types(cascade_target)
+                                if "creature" in ct_types:
+                                    creatures_entered_this_turn += 1
+                                # Fire ETB for cascaded permanent
+                                cascade_q = []
+                                ce = etb_value_cache.get(cascade_target.name, {})
+                                for ek, qa in [("tokens","create_token"),("draw","draw"),
+                                    ("damage","damage"),("lifegain","lifegain"),
+                                    ("ramp","ramp"),("counter","counter")]:
+                                    cv = ce.get(ek, 0)
+                                    if cv and cv != 0:
+                                        cascade_q.append((qa, resolve_x(cv, cascade_target.name), cascade_target.name))
+                                if not ce.get("tokens") and get_etb_tokens(cascade_target.name) > 0:
+                                    cascade_q.append(("create_token", get_etb_tokens(cascade_target.name), cascade_target.name))
+                                fire_etb_effects(cascade_target.name, ct_types, cascade_q, source="card")
+                                resolve_queue(cascade_q)
+                            else:
+                                graveyard.append(cascade_target)
+                                # One-shot effects from cascaded I/S
+                                cascade_q = []
+                                ce = etb_value_cache.get(cascade_target.name, {})
+                                for ek, qa in [("tokens","create_token"),("damage","damage"),
+                                    ("lifegain","lifegain"),("counter","counter")]:
+                                    cv = ce.get(ek, 0)
+                                    if cv and cv != 0:
+                                        cascade_q.append((qa, resolve_x(cv, cascade_target.name), cascade_target.name))
+                                resolve_queue(cascade_q)
+                            # Cascade draws from draw_cache
+                            cdn, crep, _, _ = draw_cache.get(cascade_target.name, (0, False, "", 0))
+                            if cdn > 0 and not crep:
+                                for _ in range(int(cdn)):
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                        turn_bonus += 1
+                                        draws_this_turn += 1
+
+                    # ---- MONARCH ON CAST/ETB ----
+                    if card.name in monarch_cards and not sim_is_monarch:
+                        sim_is_monarch = True
+
+                    # ---- WHEEL EFFECT ----
+                    if card.name in wheel_cache and not is_permanent:
+                        wheel_draw = wheel_cache[card.name]
+                        old_hand_size = len(hand)
+                        for hc in list(hand):
+                            graveyard.append(hc)
+                        hand.clear()
+                        for _ in range(wheel_draw):
+                            if lib:
+                                hand.append(lib.pop(0))
+                                draws_this_turn += 1
+                        turn_bonus += max(wheel_draw - old_hand_size, 0)
+
+                    # ---- EXTRA TURN ----
+                    if card.name in extra_turn_cards and not is_permanent:
+                        sim_bonus_turns += 1
+
+                    # ---- EXPERIENCE COUNTER TRACKING ----
+                    for ecn, (etrig, etype) in experience_cache.items():
+                        if ecn.lower() not in cmdr_on_battlefield:
+                            continue
+                        if etrig == "cast_is" and ("instant" in tl or "sorcery" in tl):
+                            if int(card.cmc) > sim_experience:
+                                sim_experience += 1
+                        elif etrig == "cast_enchantment" and "enchantment" in tl:
+                            sim_experience += 1
+                        elif etrig == "cast_any":
+                            sim_experience += 1
+
+                    # ---- TREASURE CREATION ON CAST (from permanents on bf) ----
+                    for bp in battlefield:
+                        if bp.name in treasure_create_cache:
+                            ttrig, tn = treasure_create_cache[bp.name]
+                            if ttrig == "cast" and bp not in cards_to_cast:
+                                sim_treasures += tn
+
+                    # Track spell count for storm / scaling copies
+                    spells_cast_this_turn += 1
+
+                # ---- TREASURE GENERATION (upkeep, landfall, opponent, ETB, combat) ----
+                for bc in battlefield:
+                    if bc.name not in treasure_create_cache:
+                        continue
+                    ttrig, tn = treasure_create_cache[bc.name]
+                    if ttrig == "upkeep" and bc not in cards_to_cast:
+                        sim_treasures += tn
+                    elif ttrig == "landfall":
+                        sim_treasures += tn * lands_played_this_turn
+                    elif ttrig == "opponent_cast" and bc not in cards_to_cast:
+                        sim_treasures += tn * 2  # goldfish: opponents cast ~2 spells/turn
+                    elif ttrig == "etb" and bc in cards_to_cast:
+                        sim_treasures += tn
+                # Consume treasures spent on spells (approximate)
+                firebend_mana = sum(firebending_cache.get(bc.name, 0) for bc in battlefield)
+                base_mana = land_count + ramp_mana + board_bonus_mana + firebend_mana
+                treasure_spent = max(0, spent - base_mana)
+                sim_treasures = max(0, sim_treasures - treasure_spent)
+
+                # ---- MONARCH EXTRA DRAW ----
+                if sim_is_monarch:
+                    if lib:
+                        hand.append(lib.pop(0))
+                        draws_this_turn += 1
+                        turn_bonus += 1
+
+                # ---- PLANESWALKER LOYALTY ACTIVATION ----
+                for bc in battlefield:
+                    if bc.name not in pw_ability_cache:
+                        continue
+                    if bc.name not in sim_pw_loyalty:
+                        loy_start, _, _, _ = pw_ability_cache[bc.name]
+                        sim_pw_loyalty[bc.name] = loy_start
+                    if bc in cards_to_cast:
+                        continue  # summoning sickness for PW
+                    loy, plus_cost, plus_action, plus_param = pw_ability_cache[bc.name]
+                    sim_pw_loyalty[bc.name] = sim_pw_loyalty.get(bc.name, loy) + plus_cost
+                    if plus_action == "draw":
+                        for _ in range(plus_param):
+                            if lib:
+                                hand.append(lib.pop(0))
+                                draws_this_turn += 1
+                                turn_bonus += 1
+                    elif plus_action == "create_token":
+                        tokens_created_this_turn += plus_param
+                    elif plus_action == "damage":
+                        chain_damage += plus_param
+
                 # ---- END-OF-TURN PASSIVE BLINKS ----
                 # Thassa, Conjurer's Closet etc.: blink once at end step
                 for bp in battlefield:
@@ -3212,6 +3817,9 @@ class SimEngine:
                                     creatures_entered_this_turn += 1
                                     fire_etb_effects(best_target.name, get_card_types(best_target), blink_q, source="card")
                                     resolve_queue(blink_q)
+                                    # Track ETB removal from blink
+                                    if etb_effs.get("removal", 0) > 0:
+                                        sim_removal_cast += 1
                             # End-step non-blink triggers (create token, draw, etc.)
                             elif ev == "end_step" and act != "blink":
                                 end_q = [(act, param, bp.name)]
@@ -3260,6 +3868,8 @@ class SimEngine:
                                     chain_damage += etb_effs["damage"]
                                 if etb_effs.get("lifegain", 0) > 0:
                                     chain_lifegain += etb_effs["lifegain"]
+                                if etb_effs.get("removal", 0) > 0:
+                                    sim_removal_cast += 1
                                 creatures_entered_this_turn += 1
                                 # ETB reaction triggers from other permanents (simplified for loop perf)
                                 for bp2 in battlefield:
@@ -3334,7 +3944,6 @@ class SimEngine:
                     tokens_created_this_turn *= (2 ** n_doublers)
 
                 sim_total_tokens += tokens_created_this_turn
-                n_tokens_this_turn = tokens_created_this_turn
 
                 # ---- DRAIN / PING DAMAGE ----
                 drain_dmg_this_turn = chain_damage  # start with damage from trigger chains
@@ -3360,9 +3969,10 @@ class SimEngine:
                 bonus_draws[t] += turn_bonus
                 total_cards[t] += len(all_seen)
 
-                # Available mana (lands + ramp + board enablers)
+                # Available mana (lands + ramp + board enablers + firebending)
                 ramp_mana_total = sum(mana_cache.get(rc.name, 1) for rc in battlefield if rc.category == "Ramp")
-                avail_mana[t] += land_ct + ramp_mana_total + board_bonus_mana
+                firebending_mana = sum(firebending_cache.get(bc.name, 0) for bc in battlefield)
+                avail_mana[t] += land_ct + ramp_mana_total + board_bonus_mana + firebending_mana + sim_treasures
                 hand_size[t] += len(hand)
 
                 # Battlefield composition
@@ -3404,6 +4014,11 @@ class SimEngine:
                     total_power += sim_total_tokens * (1 + anthem_buff)
                     # +1/+1 counters spread across creatures add to total power
                     total_power += sim_total_counters
+                    # Equipment power bonus (attached to best creature)
+                    if equip_cache and n_creatures > 0:
+                        for bc in battlefield:
+                            if bc.name in equip_cache:
+                                total_power += equip_cache[bc.name]
 
                 bf_creatures[t] += n_creatures
                 bf_artifacts[t] += n_artifacts
@@ -3414,6 +4029,33 @@ class SimEngine:
 
                 # Cumulative damage: combat (from T3) + drain/ping
                 combat_dmg = total_power if t >= 3 else 0
+
+                # ---- COMBAT DAMAGE TRIGGERS ----
+                # In goldfish, all creatures connect every combat from T3+
+                if t >= 3:
+                    combat_trigger_q = []
+                    n_attackers = n_creatures + int(sim_total_tokens)
+                    for bp in battlefield:
+                        if bp.name in trigger_cache and bp not in cards_to_cast:
+                            for ev, cond, act, param in trigger_cache[bp.name]:
+                                if ev == "damage_dealt":
+                                    if cond == "each_creature":
+                                        # Fires once per creature connecting (Frostfang, Edric, Coastal Piracy)
+                                        for _ in range(max(n_attackers, 1)):
+                                            combat_trigger_q.append((act, param, bp.name))
+                                    else:
+                                        # Fires once for this permanent (Toski, Swords)
+                                        combat_trigger_q.append((act, param, bp.name))
+                    if combat_trigger_q:
+                        resolve_queue(combat_trigger_q)
+
+                # ---- TREASURE FROM COMBAT DAMAGE ----
+                if t >= 3:
+                    for bc in battlefield:
+                        if bc.name in treasure_create_cache and bc not in cards_to_cast:
+                            ttrig, tn = treasure_create_cache[bc.name]
+                            if ttrig == "combat_damage":
+                                sim_treasures += tn
 
                 # ---- ADDITIONAL COMBAT PHASES ----
                 # Extra combats multiply combat damage (not drain/ping)
@@ -3445,8 +4087,37 @@ class SimEngine:
                 total_dmg_this_turn = combat_dmg + drain_dmg_this_turn
                 sim_cumul_dmg += total_dmg_this_turn
                 cumul_damage[t] += sim_cumul_dmg
+
+                # ---- EXTRA TURNS ----
+                # Each bonus turn: draw, play land, another combat with same board
+                bonus_turns_this_round = min(sim_bonus_turns, 3)  # cap at 3 for safety
+                sim_bonus_turns -= bonus_turns_this_round
+                for _ in range(bonus_turns_this_round):
+                    if lib:
+                        hand.append(lib.pop(0))
+                        draws_this_turn += 1
+                        turn_bonus += 1
+                    # Play land on extra turn
+                    et_land = next((c for c in hand if c.category == "Land"), None)
+                    if et_land:
+                        hand.remove(et_land); battlefield.append(et_land)
+                    # Extra combat damage
+                    if t >= 3 and total_power > 0:
+                        sim_cumul_dmg += total_power
+                        cumul_damage[t] += total_power
+
                 cards_drawn_this_turn[t] += draws_this_turn
                 gy_size[t] += len(graveyard)
+
+                # Removal tracking: cumulative cast + available in hand/on battlefield + drawn
+                removal_cast[t] += sim_removal_cast
+                n_removal_in_hand = sum(1 for c in hand if c.category in ("Removal", "Board Wipe"))
+                n_removal_in_gy = sum(1 for c in graveyard if c.category in ("Removal", "Board Wipe"))
+                n_removal_on_bf = sum(1 for c in battlefield if c.category in ("Removal", "Board Wipe"))
+                n_etb_removal_on_bf = sum(1 for bc in battlefield
+                    if etb_value_cache.get(bc.name, {}).get("removal", 0) > 0)
+                removal_available[t] += n_removal_in_hand + n_etb_removal_on_bf
+                removal_drawn[t] += n_removal_in_hand + n_removal_in_gy + n_removal_on_bf
 
                 # ---- PER-TURN COMBO CHECK ----
                 # Tracks whether all pieces have been FOUND (hand + battlefield + command zone)
@@ -3513,7 +4184,6 @@ class SimEngine:
                 # ---- PER-TURN ALTERNATE WIN CONDITION CHECK ----
                 if sim_alt_win_turn is None and alt_win_cache:
                     hand_names = {hc.name for hc in hand}
-                    all_accessible = bf_names | hand_names
                     for aw_name, (aw_type, aw_thresh) in alt_win_cache.items():
                         if sim_alt_win_turn is not None:
                             break
@@ -3742,11 +4412,15 @@ class SimEngine:
             cumul_damage[t] /= n
             cards_drawn_this_turn[t] /= n
             gy_size[t] /= n
+            removal_cast[t] /= n
+            removal_available[t] /= n
+            removal_drawn[t] /= n
 
         # Sanitize: prevent -0.0 from appearing in results (replace with +0.0)
         for d in (ld, bonus_draws, total_cards, avail_mana, hand_size, bf_creatures,
                   bf_artifacts, bf_enchantments, bf_total, token_count, combat_power,
-                  cumul_damage, cards_drawn_this_turn, gy_size):
+                  cumul_damage, cards_drawn_this_turn, gy_size, removal_cast,
+                  removal_available, removal_drawn):
             for t in d:
                 if d[t] == 0: d[t] = 0.0  # convert int 0 or -0.0 to +0.0
         if pcb: pcb(1.0)
@@ -3805,6 +4479,8 @@ class SimEngine:
                 "token_count": token_count, "combat_power": combat_power,
                 "cumul_damage": cumul_damage, "cards_drawn_this_turn": cards_drawn_this_turn,
                 "gy_size": gy_size,
+                "removal_cast": removal_cast, "removal_available": removal_available,
+                "removal_drawn": removal_drawn,
                 "win_turn_1opp": win_turn_1opp, "win_turn_3opp": win_turn_3opp,
                 "alt_win_stats": alt_win_stats}
 
@@ -5176,7 +5852,7 @@ class FasterFishing:
         self.nb = ttk.Notebook(self.root); self.nb.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         for title, builder in [("  Import Deck  ", self._ui_import),
             ("  Deck & Categories  ", self._ui_deck), ("  Analysis  ", self._ui_analysis),
-            ("  Simulations  ", self._ui_sim), ("  Goldfish Turns  ", self._ui_gf)]:
+            ("  Simulation  ", self._ui_gf)]:
             f = ttk.Frame(self.nb); self.nb.add(f, text=title); builder(f)
         self.status = tk.StringVar(value="Ready - Import a deck to begin!")
         ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, side=tk.BOTTOM)
@@ -5498,84 +6174,61 @@ class FasterFishing:
         DeckEditorWindow(self)
 
 
-    # ---- SIMULATION TAB ----
-    def _ui_sim(self, f):
+    # ---- SIMULATION TAB (merged goldfish + opening hand) ----
+    def _ui_gf(self, f):
         ctrl = ttk.LabelFrame(f, text="Simulation Settings", padding=10); ctrl.pack(fill=tk.X, padx=10, pady=10)
-        # Row 1: Simulations, Hand size, buttons
+        # Row 1: Simulations, Turns, Hand size, Mulligan
         row1 = ttk.Frame(ctrl); row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="Simulations:").pack(side=tk.LEFT)
-        self.sim_n = tk.StringVar(value="10000"); ttk.Entry(row1, textvariable=self.sim_n, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row1, text="Hand size:").pack(side=tk.LEFT, padx=(20,0))
+        self.gf_n = tk.StringVar(value="1000"); ttk.Entry(row1, textvariable=self.gf_n, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row1, text="Turns:").pack(side=tk.LEFT, padx=(15,0))
+        self.gf_t = tk.StringVar(value="10"); ttk.Entry(row1, textvariable=self.gf_t, width=5).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row1, text="Hand size:").pack(side=tk.LEFT, padx=(15,0))
         self.hand_sz = tk.StringVar(value="7"); ttk.Entry(row1, textvariable=self.hand_sz, width=5).pack(side=tk.LEFT, padx=5)
-        self.sim_btn = ttk.Button(row1, text="Run Simulation", command=self._run_sim); self.sim_btn.pack(side=tk.RIGHT, padx=5)
-        ttk.Button(row1, text="Draw Sample Hand", command=self._show_hand).pack(side=tk.RIGHT, padx=5)
+        ttk.Label(row1, text="Mull to:").pack(side=tk.LEFT, padx=(15,0))
+        self.min_mull = tk.StringVar(value="4"); ttk.Entry(row1, textvariable=self.min_mull, width=5).pack(side=tk.LEFT, padx=5)
+        self.gf_btn = ttk.Button(row1, text="Run Simulation", command=self._run_gf); self.gf_btn.pack(side=tk.RIGHT)
+        ttk.Button(row1, text="Play Goldfish", command=self._show_goldfish_game).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(row1, text="Sample Hand", command=self._show_hand).pack(side=tk.RIGHT, padx=5)
 
-        # Row 2: Mulligan
+        # Row 2: Card Priority List
         row2 = ttk.Frame(ctrl); row2.pack(fill=tk.X, pady=2)
-        ttk.Label(row2, text="Mulligan down to:").pack(side=tk.LEFT)
-        self.min_mull = tk.StringVar(value="4"); ttk.Entry(row2, textvariable=self.min_mull, width=5).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row2, text="(Commander free mull at 7)").pack(side=tk.LEFT, padx=(0,20))
-
-        # Row 3: Card Priority List
-        row3 = ttk.Frame(ctrl); row3.pack(fill=tk.X, pady=2)
-        ttk.Label(row3, text="Card Priority List:").pack(side=tk.LEFT)
+        ttk.Label(row2, text="Card Priority List:").pack(side=tk.LEFT)
         self.tutor_targets_var = tk.StringVar(value="")
-        self.tutor_targets_entry = ttk.Entry(row3, textvariable=self.tutor_targets_var, width=50)
+        self.tutor_targets_entry = ttk.Entry(row2, textvariable=self.tutor_targets_var, width=50)
         self.tutor_targets_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(row3, text="Pick...", command=self._pick_tutor_targets).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Pick...", command=self._pick_tutor_targets).pack(side=tk.LEFT, padx=2)
 
-        # Row 4: Ideal Hand Configuration
-        ideal_frame = ttk.LabelFrame(ctrl, text="Ideal Hand Configuration (probability tracked in results)", padding=5)
+        # Row 3: Ideal Hand Configuration
+        ideal_frame = ttk.LabelFrame(ctrl, text="Ideal Hand (probability tracked in results)", padding=5)
         ideal_frame.pack(fill=tk.X, pady=(5, 0))
         ideal_row = ttk.Frame(ideal_frame); ideal_row.pack(fill=tk.X)
-
-        self.ideal_hand = {}  # category -> StringVar
-        # Show spinners for common categories
+        self.ideal_hand = {}
         ideal_cats = ["Land", "Ramp", "Draw", "Removal", "Board Wipe", "Tutor", "Creature"]
         for cat in ideal_cats:
-            cf = ttk.Frame(ideal_row)
-            cf.pack(side=tk.LEFT, padx=4)
+            cf = ttk.Frame(ideal_row); cf.pack(side=tk.LEFT, padx=4)
             ttk.Label(cf, text=f"{cat}:", font=("Segoe UI", 8)).pack(side=tk.LEFT)
             var = tk.StringVar(value="")
             self.ideal_hand[cat] = var
-            sb = ttk.Spinbox(cf, from_=0, to=7, textvariable=var, width=3,
-                            font=("Segoe UI", 9))
-            sb.pack(side=tk.LEFT, padx=2)
-
+            ttk.Spinbox(cf, from_=0, to=7, textvariable=var, width=3, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=2)
         ttk.Label(ideal_row, text="(blank = any)", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(10, 0))
 
-        self.sim_prog = ttk.Progressbar(ctrl, mode="determinate", length=500); self.sim_prog.pack(fill=tk.X, pady=5)
-        rp = ttk.PanedWindow(f, orient=tk.HORIZONTAL); rp.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        lf = ttk.Frame(rp); rp.add(lf, weight=1)
-        ttk.Label(lf, text="Results", style="S.TLabel").pack(anchor=tk.W)
-        self.sim_text = tk.Text(lf, font=("Consolas",10), bg="#16213e", fg="#e0e0e0", state=tk.DISABLED, wrap=tk.WORD)
-        self.sim_text.pack(fill=tk.BOTH, expand=True)
-        for tag, color in [("header","#e94560"),("good","#2ECC71"),("warn","#F39C12"),("bad","#E74C3C"),("info","#00d2ff"),("mull","#BB86FC")]:
-            kw = {"foreground": color}
-            if tag == "header": kw["font"] = ("Consolas",11,"bold")
-            self.sim_text.tag_configure(tag, **kw)
-        rf = ttk.Frame(rp); rp.add(rf, weight=1)
-        ttk.Label(rf, text="Land Distribution Chart", style="S.TLabel").pack(anchor=tk.W)
-        self.chart = tk.Canvas(rf, bg="#16213e", highlightthickness=0); self.chart.pack(fill=tk.BOTH, expand=True)
-
-    # ---- GOLDFISH TAB ----
-    def _ui_gf(self, f):
-        ctrl = ttk.LabelFrame(f, text="Goldfish Settings", padding=10); ctrl.pack(fill=tk.X, padx=10, pady=10)
-        row = ttk.Frame(ctrl); row.pack(fill=tk.X)
-        ttk.Label(row, text="Simulations:").pack(side=tk.LEFT)
-        self.gf_n = tk.StringVar(value="1000"); ttk.Entry(row, textvariable=self.gf_n, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row, text="Turns:").pack(side=tk.LEFT, padx=(15,0))
-        self.gf_t = tk.StringVar(value="10"); ttk.Entry(row, textvariable=self.gf_t, width=5).pack(side=tk.LEFT, padx=5)
-        self.gf_btn = ttk.Button(row, text="Run Goldfish", command=self._run_gf); self.gf_btn.pack(side=tk.RIGHT)
-        ttk.Button(row, text="Play Goldfish", command=self._show_goldfish_game).pack(side=tk.RIGHT, padx=5)
         self.gf_prog = ttk.Progressbar(ctrl, mode="determinate", length=500); self.gf_prog.pack(fill=tk.X, pady=5)
-        self.gf_text = tk.Text(f, font=("Consolas",10), bg="#16213e", fg="#e0e0e0", state=tk.DISABLED, wrap=tk.WORD)
-        self.gf_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.gf_text.tag_configure("header", foreground="#e94560", font=("Consolas",11,"bold"))
-        self.gf_text.tag_configure("info", foreground="#00d2ff")
-        self.gf_text.tag_configure("good", foreground="#2ECC71")
-        self.gf_text.tag_configure("sub", foreground="#FFD700", font=("Consolas",10,"bold"))
-        self.gf_text.tag_configure("warn", foreground="#FF6B6B")
+
+        # Results: paned text + chart
+        rp = ttk.PanedWindow(f, orient=tk.HORIZONTAL); rp.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        lf = ttk.Frame(rp); rp.add(lf, weight=3)
+        self.gf_text = tk.Text(lf, font=("Consolas",10), bg="#16213e", fg="#e0e0e0", state=tk.DISABLED, wrap=tk.WORD)
+        self.gf_text.pack(fill=tk.BOTH, expand=True)
+        for tag, kw in [("header", {"foreground":"#e94560","font":("Consolas",11,"bold")}),
+                         ("info", {"foreground":"#00d2ff"}), ("good", {"foreground":"#2ECC71"}),
+                         ("sub", {"foreground":"#FFD700","font":("Consolas",10,"bold")}),
+                         ("warn", {"foreground":"#FF6B6B"}), ("bad", {"foreground":"#E74C3C"}),
+                         ("mull", {"foreground":"#BB86FC"})]:
+            self.gf_text.tag_configure(tag, **kw)
+        rf = ttk.Frame(rp); rp.add(rf, weight=1)
+        ttk.Label(rf, text="Land Distribution", style="S.TLabel").pack(anchor=tk.W)
+        self.chart = tk.Canvas(rf, bg="#16213e", highlightthickness=0); self.chart.pack(fill=tk.BOTH, expand=True)
 
     # ================================================================
     # ACTION METHODS
@@ -6413,165 +7066,6 @@ class FasterFishing:
             self.tutor_targets_var.set(", ".join(selected))
             pick_win.destroy()
 
-    def _run_sim(self):
-        if not self.cards: messagebox.showwarning("No Deck", "Import first!"); return
-        deck_cards = self._get_deck_cards()
-        if not deck_cards: messagebox.showwarning("Empty Deck", "All cards are set as commander!"); return
-        try: ns = int(self.sim_n.get()); hs = int(self.hand_sz.get())
-        except ValueError: messagebox.showerror("Error", "Enter valid numbers."); return
-        try: min_mull = int(self.min_mull.get())
-        except ValueError: min_mull = 4
-        min_mull = max(1, min(hs, min_mull))
-        land_min, land_max, cmdr_cmc, cmdr_info = self._get_land_range()
-
-        # Parse tutor target list
-        tutor_targets = None
-        tt_str = self.tutor_targets_var.get().strip()
-        if tt_str:
-            tutor_targets = [t.strip() for t in tt_str.split(",") if t.strip()]
-
-        # Parse ideal hand configuration
-        ideal_hand = {}
-        for cat, var in self.ideal_hand.items():
-            val = var.get().strip()
-            if val:
-                try:
-                    ideal_hand[cat] = int(val)
-                except ValueError:
-                    pass
-
-        self.sim_btn.configure(state=tk.DISABLED); self.sim_prog["value"] = 0
-        self._sts(f"Running {ns:,} simulations (hands {hs} down to {min_mull})...")
-        def pcb(p): self.root.after(0, lambda: self.sim_prog.configure(value=p*100))
-        def go():
-            results = SimEngine.sim_hands(deck_cards, ns, hs, pcb,
-                                          min_mull=min_mull, land_min=land_min,
-                                          land_max=land_max, commander_cmc=cmdr_cmc,
-                                          commander_cmcs=cmdr_info,
-                                          tutor_targets=tutor_targets,
-                                          ideal_hand=ideal_hand)
-            self.root.after(0, lambda: self._show_sim(results, land_min, land_max, cmdr_cmc, ideal_hand, cmdr_info))
-        threading.Thread(target=go, daemon=True).start()
-
-    def _show_sim(self, results, land_min, land_max, cmdr_cmc, ideal_hand=None, cmdr_info=None):
-        self.sim_btn.configure(state=tk.NORMAL); self._sts("Simulation complete!")
-        t = self.sim_text; t.configure(state=tk.NORMAL); t.delete("1.0", tk.END)
-
-        # Show settings
-        t.insert(tk.END, "OPENING HAND SIMULATION\n", "header")
-        cmdrs = [c for c in self.cards if c.is_commander]
-        if cmdrs:
-            cmdr_names = ", ".join(f"{c.name} (CMC {int(c.cmc)})" for c in cmdrs)
-            t.insert(tk.END, f"Commander: {cmdr_names}\n", "info")
-        t.insert(tk.END, f"Keepable: {land_min}-{land_max} lands + early play + draw/ramp for low-land hands\n")
-
-        # Show ideal hand config if set
-        if ideal_hand:
-            parts = [f"{cat}: {n}" for cat, n in ideal_hand.items() if n > 0]
-            t.insert(tk.END, f"Ideal hand: {', '.join(parts)}\n", "info")
-        t.insert(tk.END, "\n")
-
-        # Get the primary (7-card) result for the chart
-        primary_sz = max(results.keys())
-        primary = results[primary_sz]
-
-        # Commander cast turn
-        if cmdr_cmc > 0 and primary.avg_cmdr_turn > 0:
-            t.insert(tk.END, "COMMANDER CAST TURN\n", "header")
-
-            # Per-commander breakdown (for partners/dual commanders)
-            if cmdr_info and len(cmdr_info) > 1 and hasattr(primary, 'per_cmdr_turns') and primary.per_cmdr_turns:
-                for cname, ccmc in sorted(cmdr_info.items(), key=lambda x: x[1]):
-                    avg_t = primary.per_cmdr_turns.get(cname, 0)
-                    if avg_t > 0:
-                        tg = "good" if avg_t <= ccmc else "warn" if avg_t <= ccmc + 2 else "bad"
-                        t.insert(tk.END, f"  {cname} ", "info")
-                        t.insert(tk.END, f"(CMC {ccmc})", "")
-                        t.insert(tk.END, f": Turn {avg_t:.1f}\n", tg)
-                # Both commanders
-                if primary.avg_both_turn > 0:
-                    total_cmc = sum(cmdr_info.values())
-                    tg = "good" if primary.avg_both_turn <= total_cmc else "warn"
-                    t.insert(tk.END, f"  Both commanders castable: ", "info")
-                    t.insert(tk.END, f"Turn {primary.avg_both_turn:.1f}\n", tg)
-                t.insert(tk.END, "\n")
-            else:
-                # Single commander
-                t.insert(tk.END, f"  Avg earliest cast turn: ", "info")
-                turn = primary.avg_cmdr_turn
-                tg = "good" if turn <= cmdr_cmc else "warn" if turn <= cmdr_cmc + 2 else "bad"
-                t.insert(tk.END, f"Turn {turn:.1f}\n", tg)
-
-            qual = primary.hand_quality
-            qual_tg = "good" if qual >= 30 else "warn" if qual >= 15 else "bad"
-            t.insert(tk.END, f"  On-curve rate (cast by T{cmdr_cmc}): ", "info")
-            t.insert(tk.END, f"{qual:.1f}%\n", qual_tg)
-            t.insert(tk.END, f"  (factors: land drops, ramp, draw spells, tutors)\n\n")
-
-        # Mulligan summary table — Commander mulligan rules
-        if len(results) > 1:
-            t.insert(tk.END, "MULLIGAN ANALYSIS (Commander rules)\n", "header")
-            t.insert(tk.END, "  Draw 7 → free mull → draw 7 put 1 back → etc.\n\n", "info")
-            t.insert(tk.END, f"  {'Hand':>12s}  {'Keepable':>10s}  {'Avg Lands':>10s}  {'Avg Ramp':>10s}", "info")
-            if cmdr_cmc > 0:
-                t.insert(tk.END, f"  {'Cmdr Turn':>10s}  {'On Curve':>9s}", "info")
-            t.insert(tk.END, "\n")
-            t.insert(tk.END, "  " + "-" * (55 + (24 if cmdr_cmc > 0 else 0)) + "\n")
-            for sz in sorted(results.keys(), reverse=True):
-                r = results[sz]
-                if sz == primary_sz:
-                    label = "Opening + Free"
-                else:
-                    put_back = primary_sz - sz
-                    label = f"Mull to {sz} (-{put_back})"
-                tag = "good" if r.keepable >= 80 else "warn" if r.keepable >= 60 else "bad"
-                line = f"  {label:>12s}  {r.keepable:>9.1f}%  {r.cat_avgs.get('Land',0):>10.2f}  {r.cat_avgs.get('Ramp',0):>10.2f}"
-                if cmdr_cmc > 0:
-                    line += f"  {r.avg_cmdr_turn:>10.1f}  {r.hand_quality:>8.1f}%"
-                t.insert(tk.END, line + "\n", tag)
-            t.insert(tk.END, "\n")
-
-        # Ideal hand probability
-        if ideal_hand and hasattr(r, 'ideal_or_better'):
-            t.insert(tk.END, "\nIDEAL HAND PROBABILITY\n", "header")
-            parts = [f"{cat}: {n}" for cat, n in ideal_hand.items() if n > 0]
-            t.insert(tk.END, f"  Target (at least): {', '.join(parts)}\n\n", "info")
-
-            # Show per-mulligan breakdown
-            if len(results) > 1:
-                t.insert(tk.END, f"  {'Hand':>14s}  {'Probability':>12s}\n", "info")
-                t.insert(tk.END, "  " + "-" * 30 + "\n")
-                for sz in sorted(results.keys(), reverse=True):
-                    ri = results[sz]
-                    ab = getattr(ri, 'ideal_or_better', 0)
-                    if sz == primary_sz:
-                        label = "Opening + Free"
-                    else:
-                        label = f"Mull to {sz} (-{primary_sz - sz})"
-                    tg = "good" if ab >= 25 else "warn" if ab >= 10 else "bad"
-                    t.insert(tk.END, f"  {label:>14s}  {ab:>11.1f}%\n", tg)
-        t.insert(tk.END, "\n")
-
-        # Tutor Priority Tracker results
-        if primary.tutor_tracker:
-            t.insert(tk.END, "\nCARD PRIORITY LIST (avg turn seen or tutored)\n", "header")
-            t.insert(tk.END, f"  {'Card':<30s}  {'Avg Turn':>9s}  {'Found %':>8s}\n", "info")
-            t.insert(tk.END, "  " + "-" * 52 + "\n")
-            for tname, data in sorted(primary.tutor_tracker.items(),
-                                       key=lambda x: x[1]["avg_turn"] if x[1]["avg_turn"] >= 0 else 99):
-                avg = data["avg_turn"]
-                pct = data["found_pct"]
-                if avg >= 0:
-                    tg = "good" if avg <= 5 else "warn" if avg <= 10 else "bad"
-                    t.insert(tk.END, f"  {tname:<30s}  {'T'+f'{avg:.1f}':>9s}  {pct:>7.1f}%\n", tg)
-                else:
-                    t.insert(tk.END, f"  {tname:<30s}  {'never':>9s}  {pct:>7.1f}%\n", "bad")
-            t.insert(tk.END, "\n  (includes natural draws + tutor searches within 20 turns)\n", "info")
-            t.insert(tk.END, "  (draw engines on battlefield also contribute extra draws)\n", "info")
-
-        t.configure(state=tk.DISABLED)
-        self._draw_chart(r.land_dist, land_min, land_max)
-
     def _draw_chart(self, ld, land_min=2, land_max=5):
         c = self.chart; c.delete("all"); c.update_idletasks()
         w, h = c.winfo_width(), c.winfo_height()
@@ -6595,26 +7089,57 @@ class FasterFishing:
         if not deck_cards: messagebox.showwarning("Empty Deck", "All cards are set as commander!"); return
         try: ns = int(self.gf_n.get()); nt = int(self.gf_t.get())
         except ValueError: messagebox.showerror("Error", "Enter valid numbers."); return
+        try: hs = int(self.hand_sz.get())
+        except ValueError: hs = 7
+        try: min_mull = int(self.min_mull.get())
+        except ValueError: min_mull = 4
+        min_mull = max(1, min(hs, min_mull))
+        land_min, land_max, cmdr_cmc, cmdr_info = self._get_land_range()
+
+        # Parse tutor target list
+        tutor_targets = None
+        tt_str = self.tutor_targets_var.get().strip()
+        if tt_str:
+            tutor_targets = [t.strip() for t in tt_str.split(",") if t.strip()]
+
+        # Parse ideal hand configuration
+        ideal_hand = {}
+        for cat, var in self.ideal_hand.items():
+            val = var.get().strip()
+            if val:
+                try:
+                    iv = int(val)
+                    if iv > 0:  # 0 means "any amount" = no constraint
+                        ideal_hand[cat] = iv
+                except ValueError: pass
+
         self.gf_btn.configure(state=tk.DISABLED); self.gf_prog["value"] = 0
-        self._sts(f"Goldfishing {ns:,} games over {nt} turns...")
+        self._sts(f"Simulating {ns:,} games over {nt} turns...")
 
-        # Gather cached combo data if available
         combo_pieces = getattr(self, '_cached_combo_pieces', None)
-
-        # Pass commander info for combo checks (commanders are always accessible from command zone)
         commanders = [c for c in self.cards if c.is_commander]
 
         def pcb(p): self.root.after(0, lambda: self.gf_prog.configure(value=p*100))
         def go():
             try:
+                # Run goldfish sim (turn-by-turn)
                 r = SimEngine.sim_goldfish(deck_cards, ns, nt, pcb, combo_pieces=combo_pieces,
                                            commanders=commanders)
+                # Run hand sim (opening hands + mulligans) — use 5x goldfish n since it's cheap
+                hand_n = min(ns * 5, 50000)
+                hand_results = SimEngine.sim_hands(deck_cards, hand_n, hs, None,
+                                                    min_mull=min_mull, land_min=land_min,
+                                                    land_max=land_max, commander_cmc=cmdr_cmc,
+                                                    commander_cmcs=cmdr_info,
+                                                    tutor_targets=tutor_targets,
+                                                    ideal_hand=ideal_hand)
             except Exception as e:
                 import traceback
                 err_msg = traceback.format_exc()
                 self.root.after(0, lambda: self._show_gf_error(err_msg, nt))
                 return
-            self.root.after(0, lambda: self._show_gf(r, nt))
+            self.root.after(0, lambda: self._show_gf(r, nt, hand_results, land_min, land_max,
+                                                      cmdr_cmc, ideal_hand, cmdr_info))
         threading.Thread(target=go, daemon=True).start()
 
     def _show_gf_error(self, err_msg, nt):
@@ -6626,8 +7151,9 @@ class FasterFishing:
         t.insert(tk.END, "\nPlease report this error.", "info")
         t.configure(state=tk.DISABLED)
 
-    def _show_gf(self, r, nt):
-        self.gf_btn.configure(state=tk.NORMAL); self._sts("Goldfish complete!")
+    def _show_gf(self, r, nt, hand_results=None, land_min=2, land_max=5,
+                 cmdr_cmc=0, ideal_hand=None, cmdr_info=None):
+        self.gf_btn.configure(state=tk.NORMAL); self._sts("Simulation complete!")
         t = self.gf_text; t.configure(state=tk.NORMAL); t.delete("1.0", tk.END)
         if not r: t.insert(tk.END, "Deck too small."); t.configure(state=tk.DISABLED); return
 
@@ -6637,6 +7163,8 @@ class FasterFishing:
         bfc = r["bf_creatures"]; bfa = r["bf_artifacts"]; bfe = r["bf_enchantments"]; bft = r["bf_total"]
         tkc = r["token_count"]; cp = r["combat_power"]; cd = r["cumul_damage"]
         gs = r["gy_size"]
+        rmc = r.get("removal_cast", {})
+        rma = r.get("removal_available", {})
         draw_sources = r.get("draw_sources", [])
         combo_stats = r.get("combo_stats", [])
         w1 = r.get("win_turn_1opp"); w3 = r.get("win_turn_3opp")
@@ -6796,7 +7324,41 @@ class FasterFishing:
         t.insert(tk.END, "    (Includes combat + drain/ping effects; combat starts T3)\n", "info")
 
         # ═══════════════════════════════════════════════════════════
-        # SECTION 5: DRAW SOURCES
+        # SECTION 5: REMOVAL INTERACTION
+        # ═══════════════════════════════════════════════════════════
+        deck_cards = self._get_deck_cards()
+        n_removal = sum(c.quantity for c in deck_cards if c.category in ("Removal", "Board Wipe"))
+        rmd = r.get("removal_drawn", {})
+        has_removal_data = n_removal > 0 or any(rmc.get(t, 0) > 0 for t in range(1, nt+1))
+        if has_removal_data:
+            t.insert(tk.END, "\n")
+            t.insert(tk.END, "═" * 70 + "\n")
+            t.insert(tk.END, "REMOVAL & INTERACTION\n", "header")
+            total_removal_cards = n_removal
+            t.insert(tk.END, f"({total_removal_cards} removal/wipe cards in deck)\n\n")
+
+            hdr_r = f"  {'Turn':>5s}  {'Seen':>6s}  {'Cast':>6s}  {'Available':>9s}"
+            t.insert(tk.END, hdr_r + "\n", "info")
+            t.insert(tk.END, "  " + "-" * 40 + "\n")
+            for turn in range(1, nt + 1):
+                lb = f"T{turn}"
+                drawn_v = rmd.get(turn, 0)
+                cast_v = rmc.get(turn, 0)
+                avail_v = rma.get(turn, 0)
+                tag = "good" if cast_v >= 1 else "info"
+                t.insert(tk.END, f"  {lb:>5s}  {drawn_v:>6.1f}  {cast_v:>6.1f}  {avail_v:>9.1f}\n", tag)
+
+            # Summary
+            final_cast = rmc.get(nt, 0)
+            final_drawn = rmd.get(nt, 0)
+            t.insert(tk.END, f"\n  By turn {nt}: {final_drawn:.1f} removal cards drawn, "
+                     f"{final_cast:.1f} removal effects used per game\n",
+                     "good" if final_cast >= 2 else "warn" if final_cast >= 1 else "bad")
+            if final_cast < 1:
+                t.insert(tk.END, "  ⚠ Low removal density — consider adding more interaction\n", "warn")
+
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 6: DRAW SOURCES
         # ═══════════════════════════════════════════════════════════
         if draw_sources:
             t.insert(tk.END, "\n")
@@ -6850,7 +7412,116 @@ class FasterFishing:
                 tag = "good" if cs["found_pct"] >= 50 else "sub" if cs["found_pct"] >= 20 else "info" if cs["found_pct"] > 0 else "warn"
                 t.insert(tk.END, row + "\n", tag)
 
+        # ═══════════════════════════════════════════════════════════
+        # SECTION: OPENING HAND ANALYSIS (from sim_hands)
+        # ═══════════════════════════════════════════════════════════
+        if hand_results and len(hand_results) > 0:
+            t.insert(tk.END, "\n")
+            t.insert(tk.END, "═" * 70 + "\n")
+            t.insert(tk.END, "OPENING HAND ANALYSIS\n", "header")
+            cmdrs = [c for c in self.cards if c.is_commander]
+            if cmdrs:
+                cmdr_names = ", ".join(f"{c.name} (CMC {int(c.cmc)})" for c in cmdrs)
+                t.insert(tk.END, f"Commander: {cmdr_names}\n", "info")
+            t.insert(tk.END, f"Keepable: {land_min}-{land_max} lands + early play + draw/ramp for low-land hands\n")
+
+            if ideal_hand:
+                parts = [f"{cat}: {nv}" for cat, nv in ideal_hand.items() if nv > 0]
+                if parts:
+                    t.insert(tk.END, f"Ideal hand: {', '.join(parts)}\n", "info")
+            t.insert(tk.END, "\n")
+
+            primary_sz = max(hand_results.keys())
+            primary = hand_results[primary_sz]
+
+            # Commander cast turn
+            if cmdr_cmc > 0 and primary.avg_cmdr_turn > 0:
+                t.insert(tk.END, "  COMMANDER CAST TURN\n", "sub")
+                if cmdr_info and len(cmdr_info) > 1 and hasattr(primary, 'per_cmdr_turns') and primary.per_cmdr_turns:
+                    for cname, ccmc in sorted(cmdr_info.items(), key=lambda x: x[1]):
+                        avg_t = primary.per_cmdr_turns.get(cname, 0)
+                        if avg_t > 0:
+                            tg = "good" if avg_t <= ccmc else "warn" if avg_t <= ccmc + 2 else "bad"
+                            t.insert(tk.END, f"    {cname} (CMC {ccmc}): Turn {avg_t:.1f}\n", tg)
+                    if primary.avg_both_turn > 0:
+                        total_cmc = sum(cmdr_info.values())
+                        tg = "good" if primary.avg_both_turn <= total_cmc else "warn"
+                        t.insert(tk.END, f"    Both commanders castable: Turn {primary.avg_both_turn:.1f}\n", tg)
+                else:
+                    turn_v = primary.avg_cmdr_turn
+                    tg = "good" if turn_v <= cmdr_cmc else "warn" if turn_v <= cmdr_cmc + 2 else "bad"
+                    t.insert(tk.END, f"    Avg earliest cast turn: Turn {turn_v:.1f}\n", tg)
+                qual = primary.hand_quality
+                qual_tg = "good" if qual >= 30 else "warn" if qual >= 15 else "bad"
+                t.insert(tk.END, f"    On-curve rate (cast by T{cmdr_cmc}): {qual:.1f}%\n", qual_tg)
+                t.insert(tk.END, "\n")
+
+            # Mulligan analysis
+            if len(hand_results) > 1:
+                t.insert(tk.END, "  MULLIGAN ANALYSIS (Commander rules)\n", "sub")
+                t.insert(tk.END, "    Draw 7 → free mull → draw 7 put 1 back → etc.\n\n", "info")
+                hdr_m = f"    {'Hand':>12s}  {'Keepable':>10s}  {'Avg Lands':>10s}  {'Avg Ramp':>10s}"
+                if cmdr_cmc > 0:
+                    hdr_m += f"  {'Cmdr Turn':>10s}  {'On Curve':>9s}"
+                t.insert(tk.END, hdr_m + "\n", "info")
+                t.insert(tk.END, "    " + "-" * (55 + (24 if cmdr_cmc > 0 else 0)) + "\n")
+                for sz in sorted(hand_results.keys(), reverse=True):
+                    hr = hand_results[sz]
+                    if sz == primary_sz:
+                        label = "Opening + Free"
+                    else:
+                        put_back = primary_sz - sz
+                        label = f"Mull to {sz} (-{put_back})"
+                    tag = "good" if hr.keepable >= 80 else "warn" if hr.keepable >= 60 else "bad"
+                    line = f"    {label:>12s}  {hr.keepable:>9.1f}%  {hr.cat_avgs.get('Land',0):>10.2f}  {hr.cat_avgs.get('Ramp',0):>10.2f}"
+                    if cmdr_cmc > 0:
+                        line += f"  {hr.avg_cmdr_turn:>10.1f}  {hr.hand_quality:>8.1f}%"
+                    t.insert(tk.END, line + "\n", tag)
+                t.insert(tk.END, "\n")
+
+            # Ideal hand probability
+            if ideal_hand and hasattr(primary, 'ideal_or_better') and primary.ideal_or_better > 0:
+                parts = [f"{cat}: {nv}" for cat, nv in ideal_hand.items() if nv > 0]
+                if not parts:
+                    pass  # all targets are 0 → skip section entirely
+                else:
+                    t.insert(tk.END, "  IDEAL HAND PROBABILITY\n", "sub")
+                    t.insert(tk.END, f"    Target (at least): {', '.join(parts)}\n\n", "info")
+                    if len(hand_results) > 1:
+                        t.insert(tk.END, f"    {'Hand':>14s}  {'Probability':>12s}\n", "info")
+                        t.insert(tk.END, "    " + "-" * 30 + "\n")
+                        for sz in sorted(hand_results.keys(), reverse=True):
+                            ri = hand_results[sz]
+                            ab = getattr(ri, 'ideal_or_better', 0)
+                            if sz == primary_sz:
+                                label = "Opening + Free"
+                            else:
+                                label = f"Mull to {sz} (-{primary_sz - sz})"
+                            tg = "good" if ab >= 25 else "warn" if ab >= 10 else "bad"
+                            t.insert(tk.END, f"    {label:>14s}  {ab:>11.1f}%\n", tg)
+                    t.insert(tk.END, "\n")
+
+            # Card priority tracker
+            if primary.tutor_tracker:
+                t.insert(tk.END, "  CARD PRIORITY LIST (avg turn seen or tutored)\n", "sub")
+                t.insert(tk.END, f"    {'Card':<30s}  {'Avg Turn':>9s}  {'Found %':>8s}\n", "info")
+                t.insert(tk.END, "    " + "-" * 52 + "\n")
+                for tname, data in sorted(primary.tutor_tracker.items(),
+                                           key=lambda x: x[1]["avg_turn"] if x[1]["avg_turn"] >= 0 else 99):
+                    avg = data["avg_turn"]
+                    pct = data["found_pct"]
+                    if avg >= 0:
+                        tg = "good" if avg <= 5 else "warn" if avg <= 10 else "bad"
+                        t.insert(tk.END, f"    {tname:<30s}  {'T'+f'{avg:.1f}':>9s}  {pct:>7.1f}%\n", tg)
+                    else:
+                        t.insert(tk.END, f"    {tname:<30s}  {'never':>9s}  {pct:>7.1f}%\n", "bad")
+                t.insert(tk.END, "    (includes natural draws + tutor searches within 20 turns)\n", "info")
+
         t.configure(state=tk.DISABLED)
+        # Update land distribution chart from hand sim
+        if hand_results:
+            primary_sz = max(hand_results.keys())
+            self._draw_chart(hand_results[primary_sz].land_dist, land_min, land_max)
 
     # ---- ANALYSIS TAB ----
     def _ui_analysis(self, f):
@@ -7120,13 +7791,6 @@ class FasterFishing:
                 tag = "good"
                 t.insert(tk.END, f"  {label:<26s} {cnt:>6d} {qty:>5d}  {imp['desc']}\n", tag)
                 total_advantage += imp.get("potential", 0)
-
-        # Cards with no effects detected
-        effect_card_names = set()
-        for lst in effects.values():
-            for c in lst:
-                effect_card_names.add(c.name)
-        no_effect = [c for c in deck_cards if c.name not in effect_card_names and c.category != "Land"]
 
         t.insert(tk.END, f"\n  TOTAL CARD ADVANTAGE POTENTIAL: ~{total_advantage} bonus cards/interactions\n", "sub")
         t.insert(tk.END, f"  (This represents best-case cumulative impact over a full game)\n\n", "info")
