@@ -1154,8 +1154,9 @@ class SimEngine:
             return (max(n, 1), True, label, 0)
 
         # ---- EXILE TOP AND PLAY (impulse draw) ----
-        if re.search(r'exile the top\s+\w+\s+cards?[^.]*?(?:you may (?:play|cast)|until end of turn)', oracle):
-            ex_match = re.search(r'exile the top\s+(\w+)\s+cards?', oracle)
+        # Bounded .{0,120}? crosses one sentence max; (?:\w+\s+)? handles singular "card"
+        if re.search(r'exile the top\s+(?:\w+\s+)?cards?.{0,120}?(?:you may (?:play|cast)|until (?:end of|the end))', oracle):
+            ex_match = re.search(r'exile the top\s+(\w+)\s+cards', oracle)
             depth = 1
             if ex_match:
                 w = ex_match.group(1)
@@ -1282,7 +1283,7 @@ class SimEngine:
             return (2, True, "draws that many (~2/trigger)", lc)
 
         # ---- Upkeep/repeating draw (Phyrexian Arena, Sylvan Library) ----
-        if re.search(r'(?:at the beginning of|during) your (?:upkeep|draw step)[^.]*?draw', oracle):
+        if re.search(r'(?:at the beginning of|during) (?:your\s+)?(?:each\s+)?(?:upkeep|draw step|end\s+step)[^.]*?draw', oracle):
             n = parse_n(oracle)
             if "two additional" in oracle: n = max(n, 2)
             lc = life_per_cycle if pays_life else 0
@@ -1385,6 +1386,7 @@ class SimEngine:
         removal_cast = {t: 0 for t in range(turns+1)}       # cumulative removal effects used
         removal_available = {t: 0 for t in range(turns+1)}  # removal cards in hand + ETB removal on bf
         removal_drawn = {t: 0 for t in range(turns+1)}      # cumulative removal cards drawn (in hand + cast + GY)
+        opp_mill_total = {t: 0 for t in range(turns+1)}    # cumulative cards milled from opponents
 
         # Pre-compute draw estimates for each unique card
         draw_cache = {}
@@ -1400,6 +1402,53 @@ class SimEngine:
 
         # Pre-compute token generation: card_name -> (tokens_per_trigger, repeating)
         token_cache = {}
+        # Token type name: card_name -> type_string (e.g. "Human", "Treasure", "Soldier")
+        token_name_cache = {}
+        _color_words = {"white","blue","black","red","green","colorless","and","that","many"}
+        _type_exclude = {"artifact","enchantment","legendary","token","tokens","creature"}
+        def _parse_token_type(oracle_text):
+            """Extract token type name from oracle text.
+            Priority: creature type > utility type > keyword > fallback.
+            This ensures cards that create both utility and creature tokens
+            (e.g. Peregrin Took: Food + Halfling) return the creature type."""
+            ol = oracle_text.lower()
+            # 1. Creature token type (most visible/interesting)
+            m_cr = re.search(r'((?:\w+\s+){1,4})creature\s+tokens?', ol)
+            if m_cr:
+                type_words = m_cr.group(1).strip()
+                parts = [w for w in type_words.split()
+                         if w not in _color_words and w not in _type_exclude
+                         and not re.match(r'[\dx]+/[\dx]+', w) and not w.isdigit()
+                         and w != "x"]
+                if parts:
+                    return " ".join(w.title() for w in parts)
+            # 2. Copy token
+            if "copy of" in ol:
+                return "Copy"
+            # 3. Utility tokens (Treasure, Food, Clue, Blood, etc.)
+            m_util = re.search(r'(?:create|a|the)\s+(?:\w+\s+)?(treasure|clue|food|blood|shard|gold|map)\s+tokens?', ol)
+            if m_util:
+                return m_util.group(1).title()
+            # 4. Keywords that imply specific token types
+            if re.search(r'\binvestigate\b', ol):
+                return "Clue"
+            if re.search(r'\bamass\b', ol):
+                return "Zombie"
+            if re.search(r'\bfabricate\b', ol):
+                return "Servo"
+            if re.search(r'\bpopulate\b', ol):
+                return "Copy"
+            if re.search(r'\bincubate\b', ol):
+                return "Incubator"
+            # 5. Generic "create X token" with named type
+            m_other = re.search(r'create\s+(?:\w+\s+)?(\w+)\s+tokens?', ol)
+            if m_other and m_other.group(1) not in ("a","an","one","two","three","four","that","those"):
+                return m_other.group(1).title()
+            # 6. Creature fallback (matched creature token but no type name)
+            if m_cr:
+                return "Creature"
+            return "Token"
+
         for c in cards:
             oracle = (c.oracle_text or "").lower()
             if c.name not in token_cache and "create" in oracle:
@@ -1410,6 +1459,7 @@ class SimEngine:
                     n_tok = {"a":1,"an":1,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"x":-1}.get(w, int(w) if w.isdigit() else 1)
                 repeating = "whenever" in oracle or "at the beginning" in oracle
                 token_cache[c.name] = (n_tok, repeating)
+                token_name_cache[c.name] = _parse_token_type(oracle)
 
         # Pre-compute creature power: card_name -> power (for combat clock)
         power_cache = {}
@@ -1573,6 +1623,17 @@ class SimEngine:
                 m_loss = re.search(r'each\s+opponent\s+loses?\s+(\d+)\s+life', etb_text)
                 if m_loss:
                     effects["damage"] = effects.get("damage", 0) + int(m_loss.group(1))
+                # Devotion-scaled life loss: "each opponent loses X life...devotion to [color]"
+                # Sentinel: -50=W, -51=U, -52=B, -53=R, -54=G devotion
+                if not m_loss and re.search(r'each\s+opponent\s+loses?\s+\w+\s+life', etb_text):
+                    dev_m = re.search(r'devotion\s+to\s+(\w+)', etb_text)
+                    if dev_m:
+                        dev_color = dev_m.group(1)
+                        sentinel = {"white":-50,"blue":-51,"black":-52,"red":-53,"green":-54}.get(dev_color, -52)
+                        effects["damage"] = sentinel
+                        # Lifegain often matches devotion drain
+                        if re.search(r'(?:you\s+)?gain\s+life\s+equal', etb_text):
+                            effects["lifegain"] = sentinel
                 # Ramp (search for land)
                 if re.search(r'search\s+your\s+library\s+for\s+(?:a|an?)\s+(?:basic\s+)?land', etb_text):
                     effects["ramp"] = 1
@@ -1731,10 +1792,15 @@ class SimEngine:
             # ═══════════════════════════════════════
 
             # "whenever a/another creature enters the battlefield [under your control]"
-            m_cetb = re.search(r'whenever\s+(?:a|another)\s+(?:nontoken\s+)?creature\s+(?:you\s+control\s+)?enters', oracle)
+            # Also matches "creature you control of the chosen type enters" (Kindred Discovery)
+            m_cetb = re.search(r'whenever\s+(?:a|another)\s+(?:nontoken\s+)?creature\s+(?:you\s+control\s+)?(?:of\s+the\s+chosen\s+type\s+)?enters', oracle)
             if m_cetb:
                 action_text = oracle[m_cetb.end():]
                 _detect_actions(action_text, triggers, "creature_etb", "creature")
+                # "enters the battlefield or attacks" — also fires per creature during combat
+                # Treat as equivalent to Bident (per-creature combat draw)
+                if re.search(r'enters\s+the\s+battlefield\s+or\s+attacks', oracle):
+                    _detect_actions(action_text, triggers, "damage_dealt", "each_creature")
 
             # ═══════════════════════════════════════
             # ARTIFACT ETB TRIGGERS
@@ -1942,15 +2008,76 @@ class SimEngine:
 
         # Pre-compute anthem/buff effects: card_name -> buff_amount (to all creatures)
         # Only static buffs like "+1/+1 to creatures you control"
+
+        # ---- KINDRED (TRIBAL) DETECTION ----
+        # Scan creature types across all creatures in deck + commanders.
+        # If a dominant type appears on 8+ creatures, this is a kindred deck.
+        # "choose a creature type" cards will pick this type.
+        from collections import Counter as _Counter
+        kindred_type_counts = _Counter()
+        n_changelings = 0
+        all_kindred_check = list(cards) + (commanders or [])
+        for c in all_kindred_check:
+            tl = (c.type_line or "").lower()
+            oracle = (c.oracle_text or "").lower()
+            if "creature" not in tl:
+                continue
+            # Changeling = all creature types
+            if "changeling" in tl or "changeling" in oracle:
+                n_changelings += 1
+                continue  # will be added to every type's count below
+            m_sub = re.search(r'creature\s*[-\u2014]\s*(.*)', tl)
+            if m_sub:
+                subtypes = m_sub.group(1).strip().split()
+                for st in subtypes:
+                    st = st.strip().rstrip(",")
+                    if st and st not in ("the", "of", "and", "//", "legendary"):
+                        kindred_type_counts[st] += 1
+        # Add changelings to every type
+        for tp in kindred_type_counts:
+            kindred_type_counts[tp] += n_changelings
+        # Also count changeling-only if there are any
+        if n_changelings > 0 and not kindred_type_counts:
+            kindred_type_counts["changeling"] = n_changelings
+
+        kindred_type = None
+        kindred_count = 0
+        if kindred_type_counts:
+            best_type, best_count = kindred_type_counts.most_common(1)[0]
+            if best_count >= 8:
+                kindred_type = best_type
+                kindred_count = best_count
+
         anthem_cache = {}
         for c in cards:
             oracle = (c.oracle_text or "").lower()
             if c.name in anthem_cache:
                 continue
+
+            # ---- SCALING ANTHEMS ----
+            # "get +1/+1 for each [counter/creature/etc]" — scales with board state
+            m_scale = re.search(r'gets?\s+\+(\d+)/\+(\d+)\s+for\s+each\s+(\w+)', oracle)
+            if m_scale:
+                per_buff = int(m_scale.group(1))
+                scale_word = m_scale.group(3)
+                if scale_word in ("fellowship", "counter", "charge", "quest"):
+                    # Counter-based scaling (Banner of Kinship): counters ≈ creatures of type at ETB
+                    # In kindred deck, estimate ~4-6 typed creatures on BF by cast time
+                    est_counters = min(kindred_count // 2, 8) if kindred_type else 2
+                    anthem_cache[c.name] = per_buff * max(est_counters, 2)
+                elif scale_word in ("creature", "other", "attacking"):
+                    # Coat of Arms style: +1/+1 for each other creature sharing a type
+                    est_sharing = min(kindred_count // 3, 6) if kindred_type else 2
+                    anthem_cache[c.name] = per_buff * max(est_sharing, 1)
+                continue
+
             # "+N/+N" or "+N/+0" to creatures you control
             m = re.search(r'(?:other\s+)?creatures\s+you\s+control\s+get\s+\+(\d+)/\+(\d+)', oracle)
             if not m:
                 m = re.search(r'creatures\s+you\s+control\s+(?:have|get)\s+\+(\d+)/\+(\d+)', oracle)
+            if not m:
+                # "creatures you control of the chosen type get +1/+1" (Icon of Ancestry, Vanquisher's Banner)
+                m = re.search(r'creatures\s+you\s+control\s+.{0,40}?get\s+\+(\d+)/\+(\d+)', oracle)
             if m:
                 anthem_cache[c.name] = int(m.group(1))  # power buff
             else:
@@ -1959,61 +2086,473 @@ class SimEngine:
                 if m2:
                     anthem_cache[c.name] = int(m2.group(1))
 
-        # Pre-compute +1/+1 counter sources: card_name -> (trigger, counters_per)
-        # trigger: "etb_creature" (Cathars' Crusade), "upkeep" (self-grow),
-        #          "cast" (Hardened Scales bonus), "entering" (Grumgully)
+        # ---- PROWESS / MAGECRAFT DETECTION ----
+        # Prowess: +1/+1 until end of turn whenever you cast a noncreature spell.
+        # Magecraft: similar trigger on instant/sorcery cast/copy.
+        # In goldfish, noncreature spells cast per turn ≈ cards_to_cast noncreature count.
+        prowess_cache = {}  # card_name -> buff_per_spell (usually 1)
+        all_prowess_check = list(cards) + (commanders or [])
+        for c in all_prowess_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "creature" not in tl:
+                continue
+            # "Prowess" keyword = +1/+1 per noncreature spell
+            if re.search(r'\bprowess\b', oracle):
+                prowess_cache[c.name] = 1
+            # "Magecraft — whenever you cast or copy an instant or sorcery, [this] gets +N/+N"
+            elif re.search(r'magecraft.*?gets?\s+\+(\d+)/\+\d+', oracle):
+                m_mg = re.search(r'gets?\s+\+(\d+)/\+\d+', oracle)
+                prowess_cache[c.name] = int(m_mg.group(1)) if m_mg else 1
+            # "Whenever you cast a noncreature spell, [this] gets +1/+1"
+            elif re.search(r'whenever\s+you\s+cast\s+a\s+noncreature\s+spell.*?gets?\s+\+(\d+)/\+\d+', oracle):
+                m_nc = re.search(r'gets?\s+\+(\d+)/\+\d+', oracle)
+                prowess_cache[c.name] = int(m_nc.group(1)) if m_nc else 1
+
+        # Pre-compute +1/+1 counter sources: card_name -> (trigger, counters_per, scope)
+        # trigger: event that fires the counter placement
+        #   "etb_creature" — whenever a creature enters (Cathars' Crusade, Grumgully)
+        #   "upkeep" — beginning of upkeep/end step/combat (Luminarch Aspirant)
+        #   "cast" — whenever you cast a spell (Managorger Hydra)
+        #   "draw" — whenever you draw a card (Chasm Skulker, Lorescale Coatl)
+        #   "lifegain" — whenever you gain life (Archangel of Thune, Heliod)
+        #   "combat_damage" — whenever deals combat damage (Drana, Cazur)
+        #   "death" — whenever a creature/permanent dies/is sacrificed (Mazirek, Kresh)
+        #   "landfall" — whenever a land enters (Oran-Rief Hydra)
+        #   "attack" — whenever this/a creature attacks (Kalonian Hydra doubles)
+        #   "counter_placed" — whenever a +1/+1 counter is placed (Enduring Scalelord)
+        #   "activated" — pay mana: put a counter (Gavony Township, Walking Ballista)
+        # scope: "self" (counter on this creature), "each" (counter on each creature),
+        #        "target" (counter on one target), "all_attackers" (each attacking creature)
         counter_cache = {}
         counter_doubler_cards = set()  # Hardened Scales, Doubling Season counter half
+        # Counter payoffs: cards that benefit from +1/+1 counters being placed/present
+        counter_payoff_cache = {}  # card_name -> (payoff_type, param)
+        #   "draw_per_placed" — draw whenever a counter is placed (Fathom Mage)
+        #   "draw_per_counter_creature" — ETB draw per creature with counter (Armorcraft Judge)
+        #   "draw_combat_with_counter" — draw when creature with counter deals damage (Bred for the Hunt)
+        #   "cost_reduction" — costs less per creature with counter (Hamza)
+        #   "keyword_grant" — grants keyword to creatures with counters (Abzan Falconer)
+        #   "growth_tracking" — tracks counters for alt win (Simic Ascendancy)
         all_counter_cards = list(cards) + (commanders or [])
+        NW_CTR = {"a":1,"an":1,"one":1,"two":2,"three":3,"four":4,"five":5}
+
+        def _parse_counter_n(text):
+            """Extract counter count from text like 'put a +1/+1' or 'put two +1/+1'."""
+            m = re.search(r'(?:put\s+)?(\w+)\s+(?:additional\s+)?\+1/\+1\s+counter', text)
+            if m:
+                w = m.group(1)
+                return NW_CTR.get(w, int(w) if w.isdigit() else 1)
+            return 1
+
         for c in all_counter_cards:
             oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
             if c.name in counter_cache:
                 continue
 
-            # "whenever a creature enters...put a +1/+1 counter on it/each creature"
-            # Cathars' Crusade, Grumgully, Good-Fortune Unicorn
-            if re.search(r'whenever\s+(?:a|another)\s+(?:creature|nontoken\s+creature)[^.]*?enters[^.]*?\+1/\+1\s+counter', oracle):
-                m = re.search(r'(\w+)\s+\+1/\+1\s+counter', oracle)
-                n_counters = 1
-                if m:
-                    w = m.group(1)
-                    n_counters = {"a": 1, "one": 1, "two": 2, "three": 3}.get(w, int(w) if w.isdigit() else 1)
-                counter_cache[c.name] = ("etb_creature", n_counters)
+            # ═══════════════════════════════════════
+            # COUNTER SOURCES (cards that ADD +1/+1 counters)
+            # ═══════════════════════════════════════
+
+            # ---- ETB: "whenever a creature enters...+1/+1 counter" ----
+            # Cathars' Crusade, Grumgully, Good-Fortune Unicorn, Champion of Lambholt
+            if re.search(r'whenever\s+(?:a|another)\s+(?:nontoken\s+)?creature[^.]*?enters[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                # Scope: "each" if "on each creature", else "target"/"self"
+                scope = "each" if re.search(r'on\s+each\s+creature', oracle) else "target"
+                counter_cache[c.name] = ("etb_creature", n_counters, scope)
                 continue
 
-            # "at the beginning of your upkeep/end step, put a +1/+1 counter on ~"
-            if re.search(r'at\s+the\s+beginning\s+of\s+(?:your|each)[^.]*?put\s+(?:a|one|\d+)\s+\+1/\+1\s+counter\s+on', oracle):
-                m = re.search(r'put\s+(\w+)\s+\+1/\+1\s+counter', oracle)
-                n_counters = 1
-                if m:
-                    w = m.group(1)
-                    n_counters = {"a": 1, "one": 1, "two": 2, "three": 3}.get(w, int(w) if w.isdigit() else 1)
-                counter_cache[c.name] = ("upkeep", n_counters)
-                continue
-
-            # "whenever you cast a spell, put a +1/+1 counter on ~" (Managorger Hydra)
-            if re.search(r'whenever\s+(?:you\s+cast|a\s+player\s+casts)\s+[^.]*?\+1/\+1\s+counter\s+on', oracle):
-                counter_cache[c.name] = ("cast", 1)
-                continue
-
-            # "each creature you control enters with an additional +1/+1 counter"
-            if re.search(r'(?:enters|enter)\s+(?:the\s+battlefield\s+)?with\s+(?:an?\s+)?(?:additional\s+)?(?:\w+\s+)?\+1/\+1\s+counter', oracle):
-                # Could be self ("enters with") or global ("creatures enter with")
-                if re.search(r'creatures?\s+(?:you\s+control\s+)?(?:enters?|enter)\s+', oracle):
-                    m = re.search(r'(\w+)\s+(?:additional\s+)?\+1/\+1\s+counter', oracle)
-                    n_counters = 1
-                    if m:
-                        w = m.group(1)
-                        n_counters = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}.get(w, int(w) if w.isdigit() else 1)
-                    counter_cache[c.name] = ("etb_creature", n_counters)
+            # ---- ETB: "enters with additional +1/+1 counter" ----
+            # Metallic Mimic, Oona's Blackguard, Master Biomancer
+            if re.search(r'(?:enters|enter)\s+(?:the\s+battlefield\s+)?with\s+(?:an?\s+)?(?:(?:number\s+of|additional)\s+)*(?:\w+\s+)?\+1/\+1\s+counter', oracle):
+                if re.search(r'creatures?\s+(?:you\s+control\s+)?(?:of\s+the\s+chosen\s+type\s+)?(?:enters?|enter)\s+', oracle):
+                    n_counters = _parse_counter_n(oracle)
+                    # Master Biomancer: "equal to Master Biomancer's power" → variable
+                    if re.search(r'equal\s+to.*?power', oracle):
+                        n_counters = -1  # variable: resolved at runtime from power
+                    counter_cache[c.name] = ("etb_creature", n_counters, "target")
                     continue
 
-            # Counter doublers: Hardened Scales, Doubling Season (counter half), Vorinclex
-            # "that many plus one" / "twice that many counters" / "twice that many are put on"
+            # ---- DRAW-TRIGGERED: "whenever you draw a card, put +1/+1" ----
+            # Chasm Skulker, Lorescale Coatl, Body of Knowledge, Nadir Kraken
+            if re.search(r'whenever\s+you\s+draw\s+(?:a\s+card|your\s+second\s+card)[^.]*?\+1/\+1\s+counter', oracle):
+                is_second_only = "second card" in oracle  # Faerie Vandal: only 2nd draw
+                counter_cache[c.name] = ("draw", 1, "self")
+                if is_second_only:
+                    counter_cache[c.name] = ("draw_second", 1, "self")
+                continue
+
+            # ---- LIFEGAIN-TRIGGERED: "whenever you gain life, put +1/+1" ----
+            # Archangel of Thune, Heliod Sun-Crowned, Trelasarra, Nykthos Paragon
+            if re.search(r'whenever\s+you\s+gain\s+life[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                scope = "each" if re.search(r'on\s+each\s+creature', oracle) else "target"
+                # Nykthos Paragon: "put that many" → counters = life gained
+                if re.search(r'(?:that\s+many|equal\s+to.*?life)', oracle):
+                    n_counters = -1  # variable: = life gained
+                counter_cache[c.name] = ("lifegain", n_counters, scope)
+                continue
+
+            # ---- COMBAT DAMAGE: "deals combat damage...put +1/+1 counter" ----
+            # Drana Liberator (on each attacking creature), Cazur (on that creature)
+            if re.search(r'deals\s+combat\s+damage\s+to\s+(?:a\s+)?(?:player|opponent)[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                scope = "all_attackers" if re.search(r'on\s+each\s+(?:attacking\s+)?creature', oracle) else "self"
+                counter_cache[c.name] = ("combat_damage", n_counters, scope)
+                continue
+
+            # ---- ATTACK: "whenever attacks...+1/+1 counter" or "double counters" ----
+            # Kalonian Hydra (double all), Bolster N (attacks → counters)
+            if re.search(r'whenever\s+.*?attacks[^.]*?(?:\+1/\+1\s+counter|double\s+the\s+number)', oracle):
+                if re.search(r'double\s+the\s+number\s+of\s+\+1/\+1\s+counter', oracle):
+                    counter_cache[c.name] = ("attack", -2, "each")  # -2 sentinel = double
+                else:
+                    n_counters = _parse_counter_n(oracle)
+                    scope = "each" if re.search(r'on\s+each', oracle) else "self"
+                    counter_cache[c.name] = ("attack", n_counters, scope)
+                continue
+
+            # ---- DEATH/SACRIFICE: "dies/sacrifices...put +1/+1 counter" ----
+            # Mazirek (sacrifice → counter on each), Kresh (dies → X counters on self)
+            # Reyhan (dies → move counters)
+            if re.search(r'(?:dies|sacrifices?\s+a\s+permanent)[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                scope = "each" if re.search(r'on\s+each\s+creature', oracle) else "self"
+                # Kresh: "X +1/+1 counters...where X is that creature's power"
+                if re.search(r'(?:equal\s+to|where\s+x\s+is).*?power', oracle):
+                    n_counters = -1  # variable
+                counter_cache[c.name] = ("death", n_counters, scope)
+                continue
+
+            # ---- LANDFALL: "whenever a land enters...+1/+1 counter" ----
+            # Oran-Rief Hydra, Retreat to Kazandu
+            if re.search(r'(?:landfall|whenever\s+a\s+land\s+enters)[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                counter_cache[c.name] = ("landfall", n_counters, "self")
+                continue
+
+            # ---- COUNTER-PLACED TRIGGER: "whenever a +1/+1 counter is placed" ----
+            # Enduring Scalelord: "whenever another creature has a +1/+1 counter placed on it"
+            # Fathom Mage: "whenever a +1/+1 counter is placed on ~" (payoff, handled below)
+            if re.search(r'whenever\s+.*?\+1/\+1\s+counter.*?(?:placed|put)\s+on', oracle):
+                if re.search(r'put\s+(?:a|one)\s+\+1/\+1\s+counter\s+on\s+', oracle):
+                    counter_cache[c.name] = ("counter_placed", 1, "self")
+                    continue
+
+            # ---- UPKEEP / BEGINNING OF PHASE: "beginning of...put counter" ----
+            # Luminarch Aspirant (beginning of combat), self-growers
+            if re.search(r'(?:at\s+the\s+beginning\s+of|during)\s+(?:your\s+)?(?:each\s+)?(?:upkeep|end\s+step|combat)', oracle):
+                if re.search(r'\+1/\+1\s+counter', oracle):
+                    n_counters = _parse_counter_n(oracle)
+                    scope = "target" if re.search(r'on\s+target\s+creature', oracle) else "self"
+                    # "double the number" = special upkeep doubler (Hydra's Growth)
+                    if re.search(r'double\s+the\s+number\s+of\s+\+1/\+1', oracle):
+                        counter_cache[c.name] = ("upkeep", -2, "self")  # -2 = double
+                    else:
+                        counter_cache[c.name] = ("upkeep", n_counters, scope)
+                    continue
+
+            # ---- CAST-TRIGGERED: "whenever you cast...+1/+1 counter" ----
+            # Managorger Hydra, Animar
+            if re.search(r'whenever\s+(?:you\s+cast|a\s+player\s+casts)\s+[^.]*?\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                counter_cache[c.name] = ("cast", n_counters, "self")
+                continue
+
+            # ---- ACTIVATED: "{cost}: put a +1/+1 counter" ----
+            # Walking Ballista, Gavony Township, Mikaeus the Lunarch
+            if re.search(r'\{[^}]*\}[^:]*?:\s*[^.]*?put\s+(?:a|one|\d+)\s+\+1/\+1\s+counter', oracle):
+                n_counters = _parse_counter_n(oracle)
+                scope = "each" if re.search(r'on\s+each\s+(?:other\s+)?creature', oracle) else "self"
+                counter_cache[c.name] = ("activated", n_counters, scope)
+                continue
+
+            # ---- KEYWORD MECHANICS ----
+            # Evolve: whenever a creature enters with greater power/toughness → +1/+1
+            if re.search(r'\bevolve\b', oracle):
+                counter_cache[c.name] = ("etb_creature", 1, "self")
+                continue
+            # Adapt N: one-shot activated, put N counters if none present
+            m_adapt = re.search(r'\badapt\s+(\d+)', oracle)
+            if m_adapt:
+                counter_cache[c.name] = ("activated", int(m_adapt.group(1)), "self")
+                continue
+            # Outlast: {cost}, {T}: put a +1/+1 counter on this creature
+            if re.search(r'\boutlast\b', oracle):
+                counter_cache[c.name] = ("activated", 1, "self")
+                continue
+            # Bolster N: put N +1/+1 counters on creature with least toughness
+            m_bolster = re.search(r'\bbolster\s+(\d+)', oracle)
+            if m_bolster:
+                counter_cache[c.name] = ("attack", int(m_bolster.group(1)), "target")
+                continue
+            # Modular N: enters with N counters, moves on death
+            m_modular = re.search(r'\bmodular\s+(\d+)', oracle)
+            if m_modular:
+                # Enters with N, death moves them — net counter conservation
+                counter_cache[c.name] = ("etb_creature", int(m_modular.group(1)), "self")
+                continue
+            # Undying: returns with a +1/+1 counter (net gain = 1 counter per death cycle)
+            if re.search(r'\bundying\b', oracle):
+                if "other" in oracle and "creatures" in oracle:
+                    # Mikaeus: grants undying to all other creatures
+                    counter_cache[c.name] = ("death", 1, "each")
+                else:
+                    counter_cache[c.name] = ("death", 1, "self")
+                continue
+
+            # ---- BROAD CATCH-ALL: color-qualified creature ETB ----
+            # Ivy Lane Denizen: "whenever another green creature enters...+1/+1"
+            # Matches any "whenever [a/another] [adjective] creature enters...+1/+1"
+            if re.search(r'whenever\s+(?:a|another)\s+(?:\w+\s+)?creature[^.]*?enters[^.]*?\+1/\+1\s+counter', oracle):
+                if c.name not in counter_cache:
+                    n_counters = _parse_counter_n(oracle)
+                    scope = "each" if re.search(r'on\s+each\s+creature', oracle) else "target"
+                    counter_cache[c.name] = ("etb_creature", n_counters, scope)
+                    continue
+
+            # ---- ETB ONE-SHOT: "when NAME enters, put/distribute +1/+1 counters" ----
+            # Verdurous Gearhulk: "distribute four +1/+1 counters"
+            # Rishkar: "put a +1/+1 counter on each of up to two"
+            if re.search(r'when\s+\w+[^.]*?enters[^.]*?(?:put|distribute|place)\s+(?:\w+\s+)?(?:\w+\s+)?\+1/\+1\s+counter', oracle):
+                if c.name not in counter_cache:
+                    # Parse counter count from "distribute four" or "put a"
+                    m_dist = re.search(r'(?:distribute|put)\s+(\w+)\s+(?:\w+\s+)?\+1/\+1', oracle)
+                    n_counters = NW_CTR.get(m_dist.group(1), 1) if m_dist else 1
+                    if m_dist and m_dist.group(1).isdigit():
+                        n_counters = int(m_dist.group(1))
+                    counter_cache[c.name] = ("etb_creature", n_counters, "target")
+                    continue
+
+            # ---- PLANESWALKER LOYALTY: "-N: put +1/+1 counter on creatures" ----
+            # Nissa Voice of Zendikar, Ajani Mentor of Heroes, etc.
+            if "planeswalker" in tl and re.search(r'\+1/\+1\s+counter', oracle):
+                if c.name not in counter_cache:
+                    n_counters = _parse_counter_n(oracle)
+                    scope = "each" if re.search(r'on\s+each\s+creature', oracle) else "target"
+                    counter_cache[c.name] = ("upkeep", n_counters, scope)  # model as once/turn
+                    continue
+
+            # ── BROAD CATCH-ALL: any remaining "put +1/+1 counter" not yet caught ──
+            # This catches stragglers like cards with unique phrasing
+            if re.search(r'put\s+(?:a|one|\d+|two|three|four)\s+\+1/\+1\s+counter', oracle):
+                if c.name not in counter_cache and c.name not in counter_payoff_cache:
+                    n_counters = _parse_counter_n(oracle)
+                    # Try to determine trigger
+                    if re.search(r'whenever\s+.*?enters', oracle):
+                        counter_cache[c.name] = ("etb_creature", n_counters, "target")
+                    elif re.search(r'whenever\s+.*?(?:attack|deal)', oracle):
+                        counter_cache[c.name] = ("attack", n_counters, "self")
+                    elif re.search(r'\{[^}]*\}.*?:', oracle):
+                        scope = "each" if re.search(r'on\s+each\s+(?:other\s+)?creature', oracle) else "self"
+                        counter_cache[c.name] = ("activated", n_counters, scope)
+                    elif re.search(r'at\s+the\s+beginning', oracle):
+                        counter_cache[c.name] = ("upkeep", n_counters, "self")
+                    else:
+                        counter_cache[c.name] = ("cast", n_counters, "self")
+                    continue
+
+            # ═══════════════════════════════════════
+            # COUNTER DOUBLERS
+            # ═══════════════════════════════════════
             if re.search(r'(?:that\s+many\s+plus\s+one|one\s+more)\s+(?:\+1/\+1\s+)?counter', oracle):
                 counter_doubler_cards.add(c.name)
             elif re.search(r'(?:twice|double)\s+(?:that\s+)?many', oracle) and "counter" in oracle:
                 counter_doubler_cards.add(c.name)
+            elif re.search(r'places?\s+twice\s+that\s+many', oracle):
+                counter_doubler_cards.add(c.name)
+
+            # ═══════════════════════════════════════
+            # COUNTER PAYOFFS (benefit from counters existing)
+            # ═══════════════════════════════════════
+
+            # Draw per counter placed: Fathom Mage
+            if re.search(r'whenever\s+(?:a|one\s+or\s+more)\s+\+1/\+1\s+counter.*?(?:placed|put).*?draw', oracle):
+                counter_payoff_cache[c.name] = ("draw_per_placed", 1)
+                continue
+            # Draw per creature with counter: Armorcraft Judge, Inspiring Call
+            if re.search(r'draw\s+(?:a\s+)?cards?\s+(?:for\s+each|equal\s+to).*?creature.*?\+1/\+1\s+counter', oracle):
+                counter_payoff_cache[c.name] = ("draw_per_counter_creature", 1)
+                continue
+            # Draw when creature with counter deals damage: Bred for the Hunt
+            if re.search(r'creature.*?with\s+a\s+\+1/\+1\s+counter.*?deals\s+combat\s+damage.*?draw', oracle):
+                counter_payoff_cache[c.name] = ("draw_combat_with_counter", 1)
+                continue
+            # Cost reduction per counter/creature with counter: Hamza, Animar
+            if re.search(r'cost.*?\{1\}\s+less.*?(?:creature.*?\+1/\+1\s+counter|\+1/\+1\s+counter\s+on)', oracle):
+                counter_payoff_cache[c.name] = ("cost_reduction", 1)
+                continue
+            # Keyword grant: "creatures with +1/+1 counter have [keyword]"
+            if re.search(r'creature.*?with\s+(?:a\s+)?\+1/\+1\s+counter.*?(?:has|have|gains?)\s+(?:flying|trample|deathtouch|lifelink|menace|vigilance|reach|first\s+strike|double\s+strike|hexproof|indestructible)', oracle):
+                kw_m = re.search(r'(?:has|have|gains?)\s+(flying|trample|deathtouch|lifelink|menace|vigilance|reach|first\s+strike|double\s+strike|hexproof|indestructible)', oracle)
+                kw = kw_m.group(1) if kw_m else "keyword"
+                counter_payoff_cache[c.name] = ("keyword_grant", kw)
+                continue
+            # Growth tracking: Simic Ascendancy
+            if re.search(r'whenever\s+you\s+put\s+.*?\+1/\+1\s+counter.*?growth\s+counter', oracle):
+                counter_payoff_cache[c.name] = ("growth_tracking", 1)
+                continue
+            # Token per counter placed: Animation Module
+            # "whenever +1/+1 counters are placed on a permanent...create a token"
+            if re.search(r'whenever\s+(?:a|one\s+or\s+more)\s+\+1/\+1\s+counter.*?(?:placed|put)\s+on.*?create', oracle):
+                counter_payoff_cache[c.name] = ("token_per_counter_placed", 1)
+                continue
+            # Evasion: "creatures with +1/+1 counters can't be blocked"
+            if re.search(r'creature.*?with\s+\+1/\+1\s+counter.*?(?:can.?t\s+be\s+blocked|unblockable)', oracle):
+                counter_payoff_cache[c.name] = ("keyword_grant", "unblockable")
+                continue
+            # Mana from counters: "creature with +1/+1 counter has {T}: Add"
+            if re.search(r'creature.*?with\s+(?:a\s+)?\+1/\+1\s+counter.*?\{t\}:\s*add', oracle):
+                counter_payoff_cache[c.name] = ("mana_from_counters", 1)
+                continue
+            # Untap creatures with counters: Ivorytusk Fortress
+            if re.search(r'untap\s+(?:each\s+)?creature.*?with\s+(?:a\s+)?\+1/\+1\s+counter', oracle):
+                counter_payoff_cache[c.name] = ("untap_with_counters", 1)
+                continue
+
+        # ═══════════════════════════════════════════════════════════════
+        # -1/-1 COUNTER SYSTEM
+        # Tracks cards that place -1/-1 counters and payoffs that trigger from them.
+        # Key archetypes: Hapatra, Yawgmoth, Scorpion God, Amonkhet -1/-1 themes.
+        #
+        # neg_counter_sources: card_name -> (trigger, n_counters, scope)
+        #   trigger: "activated" (Yawgmoth, Carnifex Demon), "cast" (Black Sun's Zenith),
+        #            "etb" (Skinrender), "upkeep" (Midnight Banshee), "attack" (Decimator Beetle)
+        #   scope: "single" (one target), "each_opponent" (all opponent creatures),
+        #          "each_all" (all creatures), "self" (remove from self to place on others)
+        # neg_counter_payoffs: card_name -> (payoff_type, param)
+        #   "token_per_counter" — create N tokens per -1/-1 placed (Hapatra, Nest of Scarabs)
+        #   "draw_on_neg_death" — draw when creature with -1/-1 dies (Scorpion God)
+        #   "chain_neg" — when creature with -1/-1 dies, put -1/-1 on another (Blowfly Infestation)
+        #   "draw_per_neg" — draw per -1/-1 placed (Generous Patron variant)
+        # neg_counter_engines: card_name -> (sac_cost, effects)
+        #   Yawgmoth-style: sacrifice creature → put -1/-1 on another + draw + pay life
+        # ═══════════════════════════════════════════════════════════════
+        neg_counter_sources = {}
+        neg_counter_payoffs = {}
+        neg_counter_engines = {}
+
+        for c in all_counter_cards:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if c.name in neg_counter_sources or c.name in neg_counter_payoffs or c.name in neg_counter_engines:
+                continue
+
+            # ---- ENGINE: sacrifice + put -1/-1 + draw (Yawgmoth) ----
+            if re.search(r'sacrifice\s+(?:a|another)\s+creature[^.]*?put\s+(?:a\s+)?-1/-1\s+counter', oracle):
+                has_draw = "draw" in oracle
+                has_life = "pay" in oracle and "life" in oracle
+                neg_counter_engines[c.name] = ("sacrifice", {"draw": has_draw, "life_cost": has_life})
+                continue
+
+            # ---- PAYOFFS: whenever -1/-1 counter is placed ----
+            # "whenever a -1/-1 counter is put on a creature" / "whenever you put -1/-1"
+            if re.search(r'whenever\s+(?:a|one\s+or\s+more)\s+-1/-1\s+counter', oracle) or \
+               re.search(r'whenever\s+you\s+put\s+(?:a|one\s+or\s+more)\s+-1/-1', oracle):
+                if re.search(r'create\s+', oracle):
+                    # Token per counter: Hapatra, Flourishing Defenses, Nest of Scarabs
+                    m_tok = re.search(r'create\s+(\w+)', oracle)
+                    n_tok = NW_CTR.get(m_tok.group(1), 1) if m_tok else 1
+                    # Nest of Scarabs: "create that many" = N tokens per N counters
+                    if "that many" in oracle:
+                        n_tok = -1  # variable: = number of counters placed
+                    neg_counter_payoffs[c.name] = ("token_per_counter", n_tok)
+                    continue
+                elif "draw" in oracle:
+                    neg_counter_payoffs[c.name] = ("draw_per_neg", 1)
+                    continue
+                elif re.search(r'(?:loses?\s+\d+\s+life|you\s+gain\s+\d+\s+life)', oracle):
+                    # Obelisk Spider: opponents lose life, you gain life per -1/-1
+                    neg_counter_payoffs[c.name] = ("drain_per_neg", 1)
+                    continue
+
+            # "whenever a creature with -1/-1 counter dies" → draw/effect
+            # Also: "whenever a creature dies, if it had a -1/-1 counter" (Blowfly Infestation)
+            if re.search(r'(?:creature|permanent)\s+(?:an\s+opponent\s+controls\s+)?(?:with|that\s+has)\s+(?:a\s+)?-1/-1\s+counter.*?dies', oracle) or \
+               re.search(r'creature\s+dies.*?(?:had|has|with)\s+(?:a\s+)?-1/-1\s+counter', oracle):
+                if "draw" in oracle:
+                    neg_counter_payoffs[c.name] = ("draw_on_neg_death", 1)
+                    continue
+                if re.search(r'put\s+(?:a\s+)?-1/-1\s+counter', oracle):
+                    neg_counter_payoffs[c.name] = ("chain_neg", 1)
+                    continue
+
+            # Scorpion God: "whenever a creature with -1/-1 counter on it dies, draw"
+            if re.search(r'-1/-1\s+counter\s+on\s+it\s+dies.*?draw', oracle):
+                neg_counter_payoffs[c.name] = ("draw_on_neg_death", 1)
+                continue
+
+            # ---- SOURCES: cards that place -1/-1 counters ----
+            if "-1/-1 counter" not in oracle:
+                continue
+
+            # Activated: "{cost}: put -1/-1 counter" (Carnifex Demon, Contagion Engine)
+            if re.search(r'\{[^}]*\}[^:]*?:\s*[^.]*?(?:put|place)\s+(?:\w+\s+)?-1/-1\s+counter', oracle):
+                n_ctr = _parse_counter_n(oracle.replace("-1/-1", "+1/+1"))  # reuse parser
+                scope = "each_all" if re.search(r'on\s+each\s+(?:other\s+)?creature', oracle) else "single"
+                neg_counter_sources[c.name] = ("activated", n_ctr, scope)
+                continue
+
+            # Upkeep: "at the beginning...put -1/-1 counter on each"
+            if re.search(r'(?:beginning|upkeep|end\s+step)[^.]*?-1/-1\s+counter', oracle):
+                n_ctr = _parse_counter_n(oracle.replace("-1/-1", "+1/+1"))
+                scope = "each_all" if re.search(r'each\s+(?:other\s+)?(?:non|creature)', oracle) else "single"
+                neg_counter_sources[c.name] = ("upkeep", n_ctr, scope)
+                continue
+
+            # ETB: "when enters, put -1/-1 counters" (Skinrender, Plague Engineer)
+            if re.search(r'when.*?enters[^.]*?-1/-1\s+counter', oracle):
+                n_ctr = _parse_counter_n(oracle.replace("-1/-1", "+1/+1"))
+                neg_counter_sources[c.name] = ("etb", n_ctr, "single")
+                continue
+
+            # Attack trigger: "whenever attacks, put -1/-1 counter" (Decimator Beetle)
+            if re.search(r'whenever.*?attacks[^.]*?-1/-1\s+counter', oracle):
+                n_ctr = _parse_counter_n(oracle.replace("-1/-1", "+1/+1"))
+                neg_counter_sources[c.name] = ("attack", n_ctr, "single")
+                continue
+
+            # Cast one-shot: sorcery/instant that places -1/-1 (Black Sun's Zenith)
+            if "instant" in tl or "sorcery" in tl:
+                n_ctr = _parse_counter_n(oracle.replace("-1/-1", "+1/+1"))
+                scope = "each_all" if re.search(r'(?:each|all)\s+creature', oracle) else "single"
+                # X-cost: "put X -1/-1 counters on each creature"
+                if re.search(r'put\s+x\s+-1/-1', oracle):
+                    n_ctr = -1
+                neg_counter_sources[c.name] = ("cast", n_ctr, scope)
+                continue
+
+            # Self -1/-1 as cost: "Put a -1/-1 counter on SELF: [effect]" (Devoted Druid)
+            if re.search(r'put\s+(?:a\s+)?-1/-1\s+counter\s+on\s+[^:]+:', oracle):
+                neg_counter_sources[c.name] = ("activated", 1, "self")
+                continue
+
+            # Remove -1/-1 from self to place on another: Grim Poppet
+            if re.search(r'remove\s+(?:a\s+)?-1/-1\s+counter\s+from\s+\w+\s*:\s*[^.]*?put\s+(?:a\s+)?-1/-1\s+counter', oracle):
+                neg_counter_sources[c.name] = ("activated", 1, "single")
+                continue
+
+            # Enters with -1/-1 counters on itself (Grim Poppet, Carnifex Demon self-counters)
+            # These are sources when combined with removal abilities above
+            if re.search(r'enters\s+(?:the\s+battlefield\s+)?with\s+(?:\w+\s+)?-1/-1\s+counter', oracle):
+                if c.name not in neg_counter_sources:
+                    # Only tag if it has a way to use those counters
+                    if re.search(r'remove\s+(?:a\s+)?-1/-1\s+counter', oracle):
+                        neg_counter_sources[c.name] = ("activated", 1, "single")
+                        continue
+
+            # Persist keyword: returns with -1/-1 (death trigger source)
+            if re.search(r'\bpersist\b', oracle):
+                neg_counter_sources[c.name] = ("death_self", 1, "self")
+                continue
+
+            # Wither/Infect: combat damage as -1/-1 counters
+            if re.search(r'\b(?:wither|infect)\b', oracle) and "creature" in tl:
+                pw = power_cache.get(c.name, 1)
+                neg_counter_sources[c.name] = ("combat", pw, "single")
+                continue
 
         # Pre-compute token doublers: card_name -> multiplier
         # Parallel Lives, Doubling Season, Anointed Procession, Chatterfang (partial),
@@ -2058,6 +2597,28 @@ class SimEngine:
             # "whenever you create a treasure/clue/food, create an additional [type]"
             elif re.search(r'whenever\s+you\s+create\s+(?:a|one\s+or\s+more)\s+(?:treasure|clue|food|blood)[^.]*?create\s+(?:a|an|that\s+many)', oracle):
                 token_type_replacers[c.name] = 2
+
+        # ---- MANA DOUBLER / TRIPLER DETECTION ----
+        # Only permanents with explicit mana multiplication text.
+        # Nyxbloom Ancient (3x), Mana Reflection (2x), Mirari's Wake (+1/land), Crypt Ghast (+1/swamp)
+        mana_multiplier_cache = {}  # card_name -> multiplier (2, 3, or "add_1")
+        for c in list(cards) + (commanders or []):
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" in tl or "sorcery" in tl:
+                continue
+            # "produces three times as much of that mana" — Nyxbloom Ancient
+            if re.search(r'produces?\s+three\s+times\s+as\s+much\s+of\s+that\s+mana', oracle):
+                mana_multiplier_cache[c.name] = 3
+            # "produces twice that much mana" — Mana Reflection
+            elif re.search(r'produces?\s+twice\s+that\s+much\s+mana', oracle):
+                mana_multiplier_cache[c.name] = 2
+            # "whenever you tap a land for mana, add one mana" — Mirari's Wake
+            elif re.search(r'whenever\s+you\s+tap\s+a\s+land\s+for\s+mana.*?add\s+one\s+mana', oracle):
+                mana_multiplier_cache[c.name] = "add_1"
+            # "whenever you tap a [basic type] for mana, add" — Crypt Ghast, Nirkana Revenant
+            elif re.search(r'whenever\s+you\s+tap\s+a\s+(?:swamp|forest|plains|island|mountain)\s+for\s+mana', oracle):
+                mana_multiplier_cache[c.name] = "add_1"
 
         # ---- BOARD MANA ENABLERS ----
         # Cards that let you tap permanents for mana (not in Ramp category)
@@ -2207,10 +2768,13 @@ class SimEngine:
         #                          Happily Ever After (5 colors + 6 types + life >= starting)
         #
         # Not simulatable (skip or generic heuristic):
-        #   "life_total_exact"   — Near-Death Experience (exactly 1 life)
         #   "instant_win"        — Hedron Alignment (4 zones), Barren Glory (empty board+hand),
-        #                          Ramses Assassin Lord, Battle of Wits (impossible in EDH),
-        #                          Biovisionary (4 copies, singleton), Promising Stairs (8 Rooms)
+        #                          Battle of Wits (impossible in EDH), Promising Stairs (8 Rooms)
+        #
+        # Simulatable (now tracked):
+        #   "life_total_exact"   — Near-Death Experience (exactly 1 life) — tracks sim_life with costs
+        #   "clone_copies"       — Biovisionary (4 copies via clones)
+        #   "creature_names_combat" — Ramses Assassin Lord (3+ named creatures dealing damage)
         #
         alt_win_cache = {}
         all_altwin_check = list(cards) + (commanders or [])
@@ -2224,6 +2788,16 @@ class SimEngine:
                     if "creature" in tl or re.search(r'creatures?\s+.*?(?:gain|have)\s+.*?\binfect\b', oracle):
                         alt_win_cache[c.name] = ("poison", 10)
                 continue
+
+            # ---- Biovisionary: "control four or more creatures named" (MUST be before creature_count) ----
+            if re.search(r'(?:four|4)\s+or\s+more\s+creatures?\s+named', oracle):
+                alt_win_cache[c.name] = ("clone_copies", 4); continue
+
+            # ---- Ramses: "dealt combat damage by three or more creatures with different names" ----
+            # (MUST be before "that player loses the game" generic)
+            if re.search(r'(?:three|3)\s+or\s+more\s+creatures?\s+with\s+different\s+names', oracle):
+                if re.search(r'combat\s+damage', oracle):
+                    alt_win_cache[c.name] = ("creature_names_combat", 3); continue
 
             # ---- "Target/that player loses the game" (Door to Nothingness, Phage) ----
             if re.search(r'(?:target|that)\s+player\s+loses\s+the\s+game', oracle):
@@ -2376,6 +2950,44 @@ class SimEngine:
             "Other": (0.80, 0.80),
         }
 
+        # ---- GOLDFISH-DEAD CARD DETECTION ----
+        # Cards whose primary effect does nothing in goldfish solitaire.
+        # These consume mana with zero benefit → skip casting entirely.
+        goldfish_dead = set()
+        all_dead_check = list(cards) + (commanders or [])
+        for c in all_dead_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if not oracle:
+                continue
+            # Only mark I/S as dead (permanents at least have bodies for combat)
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            # Already categorized as Removal — keep at 30% (represents interaction budget)
+            if c.category == "Removal" or c.category == "Board Wipe":
+                continue
+            # Already has draw/ramp/token value — not dead
+            if c.name in draw_cache and draw_cache[c.name][0] > 0:
+                continue
+            # Counterspells: "counter target [type] spell"
+            if re.search(r'counter\s+target\s+[\w\s]*spell', oracle):
+                goldfish_dead.add(c.name)
+                continue
+            # Hand disruption: "target opponent reveals/discards"
+            if re.search(r'target\s+(?:opponent|player)\s+(?:reveals?\s+their\s+hand|discards?)', oracle):
+                if "draw" not in oracle and "search" not in oracle:
+                    goldfish_dead.add(c.name)
+                    continue
+            # Redirect: "choose new targets for target spell"
+            if re.search(r'choose\s+new\s+targets?\s+for', oracle):
+                goldfish_dead.add(c.name)
+                continue
+            # Pure opponent restriction with no self-benefit
+            if re.search(r'(?:opponents?|that\s+player)\s+can.?t\s+(?:cast|draw|play|attack|search|activate)', oracle):
+                if "draw" not in oracle and "create" not in oracle:
+                    goldfish_dead.add(c.name)
+                    continue
+
         # ---- COMBO PIECE AWARENESS ----
         # Build a lookup: card_name_lower -> list of combo sets it belongs to
         # Each combo set is a frozenset of card names (lowered)
@@ -2408,9 +3020,132 @@ class SimEngine:
         # Alternate win condition tracking across all games
         alt_win_turn_sum = 0
         alt_win_turn_count = 0
+        kill_turn_1opp_sum = 0
+        kill_turn_1opp_count = 0
+        kill_turn_3opp_sum = 0
+        kill_turn_3opp_count = 0
+        mill_kill_1opp_sum = 0
+        mill_kill_1opp_count = 0
+        mill_kill_3opp_sum = 0
+        mill_kill_3opp_count = 0
         alt_win_types_seen = set()
         for cname, (wtype, _thresh) in alt_win_cache.items():
             alt_win_types_seen.add(wtype)
+
+        # ---- OPPONENT MILL DETECTION ----
+        # Cards that mill opponents: "target player/opponent mills N", "each opponent mills N"
+        # opp_mill_cache: card_name -> (mill_amount, trigger_type)
+        #   trigger_type: "cast" (one-shot I/S), "etb", "landfall", "attack", "upkeep", "activated", "damage_dealt"
+        opp_mill_cache = {}
+        mill_doubler_cards = set()  # Bruvac: doubles opponent mill
+        nw_mill = {"a":1,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,
+                   "eight":8,"ten":10,"twelve":12,"thirteen":13,"half":-2}
+        all_mill_check = list(cards) + (commanders or [])
+        for c in all_mill_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            # Mill doubler (Bruvac)
+            if re.search(r'opponent\s+would\s+mill.*?mill\s+(?:twice|double)', oracle):
+                mill_doubler_cards.add(c.name)
+                continue
+            # "each opponent mills N cards"
+            m_each = re.search(r'each\s+opponent\s+mills?\s+(\w+)\s+cards?', oracle)
+            # "target player/opponent mills N cards"
+            m_tgt = re.search(r'target\s+(?:player|opponent)\s+mills?\s+(\w+)\s+cards?', oracle)
+            # "each opponent exiles cards from the top" (Tasha-style)
+            m_exile = re.search(r'each\s+opponent\s+exiles?\s+cards?\s+from\s+the\s+top', oracle)
+            # "that player mills cards equal to" (power-based: Altar, Phenax)
+            m_equal = re.search(r'mills?\s+cards?\s+equal\s+to', oracle)
+            mill_n = 0
+            if m_each:
+                w = m_each.group(1)
+                mill_n = nw_mill.get(w, int(w) if w.isdigit() else 3)
+            elif m_tgt:
+                # For cards with multiple mill amounts (Persistent Petitioners: mill 1 + mill 12),
+                # find ALL matches and use the largest
+                all_tgt = re.findall(r'(?:target\s+(?:player|opponent)|each\s+opponent)\s+mills?\s+(\w+)\s+cards?', oracle)
+                best = 0
+                for w in all_tgt:
+                    v = nw_mill.get(w, int(w) if w.isdigit() else 1)
+                    if v > best:
+                        best = v
+                mill_n = best if best > 0 else nw_mill.get(m_tgt.group(1), 3)
+            elif m_exile:
+                mill_n = 10
+            elif m_equal:
+                mill_n = -3  # sentinel: variable
+            else:
+                # "that player mills a card/N cards"
+                m_that = re.search(r'(?:that|defending)\s+player\s+mills?\s+(?:a\s+card|(\w+)\s+cards?)', oracle)
+                if m_that:
+                    w = m_that.group(1) if m_that.group(1) else "a"
+                    mill_n = nw_mill.get(w, int(w) if w.isdigit() else 1)
+                # "mills that many cards" — variable (Mindcrank)
+                elif re.search(r'mills?\s+that\s+many\s+cards?', oracle):
+                    mill_n = -3
+                # "controller mills a card" — Mesmeric Orb
+                elif re.search(r'(?:controller|owner)\s+mills?\s+(?:a\s+card|(\w+)\s+cards?)', oracle):
+                    mill_n = 1
+                # "mills half their library" — Traumatize
+                elif re.search(r'mills?\s+half\s+(?:their|that|target)', oracle):
+                    mill_n = -2
+            if mill_n == 0:
+                continue
+            # Determine trigger type
+            is_spell = "instant" in tl or "sorcery" in tl
+            if is_spell:
+                opp_mill_cache[c.name] = (mill_n, "cast")
+            elif re.search(r'whenever\s+(?:a|each|one\s+or\s+more)\s+\w+\s+(?:\w+\s+)*?(?:you\s+control\s+)?deals?\s+combat\s+damage\s+to\s+(?:a\s+)?(?:player|opponent)', oracle):
+                # Per-creature combat damage mill
+                # Check if "for each [N] damage" → mill = damage dealt (not flat N per creature)
+                if re.search(r'mills?\s+(?:a\s+card|cards?)\s+(?:for\s+each|equal\s+to).*?damage', oracle):
+                    # Anowon: mills cards equal to damage dealt by each creature
+                    opp_mill_cache[c.name] = (mill_n, "combat_per_damage")
+                else:
+                    # Flat N per creature connecting
+                    opp_mill_cache[c.name] = (mill_n, "combat_per_creature")
+            elif re.search(r'deals?\s+combat\s+damage\s+to\s+(?:a\s+)?(?:player|opponent)', oracle):
+                # Self-only combat damage: "[card name] deals combat damage to a player"
+                # Mills once per combat (Merfolk Windrobber)
+                opp_mill_cache[c.name] = (mill_n, "attack")
+            elif re.search(r'(?:landfall|whenever\s+a\s+land\s+enters)', oracle):
+                opp_mill_cache[c.name] = (mill_n, "landfall")
+            elif re.search(r'whenever.*?attacks', oracle):
+                opp_mill_cache[c.name] = (mill_n, "attack")
+            elif re.search(r'whenever\s+(?:an?\s+)?opponent\s+casts', oracle):
+                # Memory Erosion: opponents cast ~2-3 spells per turn
+                opp_mill_cache[c.name] = (mill_n, "opponent_cast")
+            elif re.search(r'whenever\s+(?:a\s+)?permanent\s+(?:becomes?\s+)?untapped', oracle):
+                # Mesmeric Orb: opponents untap all their permanents each turn
+                opp_mill_cache[c.name] = (mill_n, "opponent_untap")
+            elif re.search(r'(?:beginning|upkeep|end\s+step)', oracle):
+                # Check for monarch-conditional higher mill (Court of Cunning)
+                m_monarch_mill = re.search(r'if\s+you\s+are\s+the\s+monarch.*?mills?\s+(\w+)\s+cards', oracle)
+                if m_monarch_mill and "you become the monarch" in oracle:
+                    # Card makes you monarch AND has a higher mill rate as monarch
+                    w_mon = m_monarch_mill.group(1)
+                    monarch_mill = nw_mill.get(w_mon, int(w_mon) if w_mon.isdigit() else mill_n)
+                    if monarch_mill > mill_n:
+                        mill_n = monarch_mill
+                opp_mill_cache[c.name] = (mill_n, "upkeep")
+            elif re.search(r'\{.*?\},?\s*\{?t?\}?.*?:.*?mill', oracle) or re.search(r'sacrifice.*?:.*?mill', oracle):
+                opp_mill_cache[c.name] = (mill_n, "activated")
+            elif re.search(r'whenever\s+(?:a|another)\s+(?:\w+\s+)?(?:permanent|creature|artifact|enchantment)\s+enters\s+the\s+battlefield', oracle):
+                opp_mill_cache[c.name] = (mill_n, "permanent_etb")
+            elif re.search(r'whenever\s+.*?(?:enters\s+the\s+battlefield\s+under\s+your\s+control)', oracle):
+                # Broader ETB: "whenever [name] or another Rogue enters the battlefield under your control"
+                opp_mill_cache[c.name] = (mill_n, "permanent_etb")
+            elif re.search(r'when.*?enters', oracle):
+                opp_mill_cache[c.name] = (mill_n, "etb")
+            elif re.search(r'whenever.*?loses?\s+life', oracle):
+                opp_mill_cache[c.name] = (mill_n, "damage_dealt")
+            elif re.search(r'whenever\s+you\s+draw', oracle):
+                opp_mill_cache[c.name] = (mill_n, "draw")
+            elif not is_spell and re.search(r'whenever\s+you\s+cast\s+(?:a|an)\s', oracle):
+                # Permanent that mills whenever you cast any spell (Consuming Aberration)
+                opp_mill_cache[c.name] = (mill_n, "whenever_cast")
+            else:
+                opp_mill_cache[c.name] = (mill_n, "cast")
 
         # Detect extra land drop cards
         extra_land_cards = set()
@@ -2420,6 +3155,59 @@ class SimEngine:
                 extra_land_cards.add(c.name)
             elif re.search(r'you\s+may\s+play\s+(?:two|three)\s+additional\s+lands?', oracle):
                 extra_land_cards.add(c.name)
+
+        # ---- ENTERS-TAPPED LAND DETECTION ----
+        tapland_cards = set()
+        for c in cards:
+            if c.category != "Land":
+                continue
+            oracle = (c.oracle_text or "").lower()
+            name_l = c.name.lower()
+            tl = (c.type_line or "").lower()
+            # "enters the battlefield tapped"
+            if "enters the battlefield tapped" in oracle or "enters tapped" in oracle:
+                tapland_cards.add(c.name)
+            # Common tapland patterns in name (budget lands)
+            elif any(w in name_l for w in ("guildgate", "life-land", "gain land", "refuge")):
+                tapland_cards.add(c.name)
+
+        # ---- FETCH LAND DETECTION ----
+        # Lands that sacrifice to search library for a land and put it on battlefield.
+        # fetch_land_cache: card_name -> (land_types_to_find, enters_tapped)
+        #   land_types_to_find: set of basic land type names the fetch can find
+        #   enters_tapped: True if fetched land enters tapped (Evolving Wilds)
+        fetch_land_cache = {}
+        basic_type_words = {"plains", "island", "swamp", "mountain", "forest"}
+        for c in cards:
+            if c.category != "Land":
+                continue
+            oracle = (c.oracle_text or "").lower()
+            if "sacrifice" not in oracle or "search" not in oracle:
+                continue
+            # Must search library for a land and put it on battlefield
+            if not re.search(r'search\s+your\s+library\s+for\s+(?:a|an)\s+.*?(?:land|plains|island|swamp|mountain|forest).*?(?:put\s+it|put\s+that\s+card)\s+(?:onto|on)\s+the\s+battlefield', oracle):
+                continue
+            # Parse which types it can find
+            search_clause = oracle.split("search")[1].split("battlefield")[0] if "search" in oracle else ""
+            types_found = set()
+            for bt in basic_type_words:
+                if bt in search_clause:
+                    types_found.add(bt)
+            # "basic land card" = any basic land type
+            if re.search(r'basic\s+land\s+card', search_clause) or not types_found:
+                types_found = set(basic_type_words)
+            # Does the fetched land enter tapped?
+            enters_tapped = "battlefield tapped" in oracle
+            fetch_land_cache[c.name] = (types_found, enters_tapped)
+
+        # ---- LANDS FROM GRAVEYARD DETECTION ----
+        # Crucible of Worlds, Ramunap Excavator: "You may play lands from your graveyard"
+        lands_from_gy_cards = set()
+        all_gy_land_check = list(cards) + (commanders or [])
+        for c in all_gy_land_check:
+            oracle = (c.oracle_text or "").lower()
+            if re.search(r'(?:you\s+may\s+)?play\s+land(?:s|\s+cards?)?\s+from\s+(?:your\s+)?graveyard', oracle):
+                lands_from_gy_cards.add(c.name)
 
         # Detect conditional draw spells (need board state to be good)
         conditional_draw_cards = {}  # card_name -> min_power needed on battlefield
@@ -2687,6 +3475,39 @@ class SimEngine:
             if m and "spells your opponents cast" not in oracle:
                 cost_reduction_cache[c.name] = (int(m.group(1)), "any"); continue
 
+        # ---- ACTIVATED ABILITY COST REDUCTION DETECTION ----
+        # Training Grounds, Zirda, Heartstone, Biomancer's Familiar
+        # These reduce costs of activated abilities (Clue/Food/Blood sac, equip, blink, etc.)
+        # IMPORTANT: Most have "can't reduce ... to less than one mana" — floor of 1
+        activated_cost_reduction_cache = {}  # card_name -> (amount, target_type, min_cost)
+        # target_type: "creature" (Training Grounds), "any" (Zirda), "artifact" etc.
+        # min_cost: 1 if "can't reduce" clause present, 0 if absent
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" in tl or "sorcery" in tl:
+                continue
+            # Determine floor: most have "can't reduce" text → floor=1
+            # Cards without that clause (very rare, e.g. Mutagenic Ooze) → floor=0
+            has_floor = "can't reduce" in oracle or "cannot reduce" in oracle or "less than one" in oracle
+            min_cost = 1 if has_floor else 0
+            # "Activated abilities of creatures you control cost {N} less to activate"
+            m = re.search(r'activated\s+abilities?\s+of\s+creatures?\s+(?:you\s+control\s+)?cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                activated_cost_reduction_cache[c.name] = (int(m.group(1)), "creature", min_cost); continue
+            # "Abilities you activate ... cost {N} less to activate" (Zirda)
+            m = re.search(r'abilities?\s+you\s+activate.*?cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                activated_cost_reduction_cache[c.name] = (int(m.group(1)), "any", min_cost); continue
+            # "Activated abilities of artifacts cost {N} less" (Etherium Sculptor variant)
+            m = re.search(r'activated\s+abilities?\s+of\s+artifacts?\s+(?:you\s+control\s+)?cost\s+\{(\d+)\}\s+less', oracle)
+            if m:
+                activated_cost_reduction_cache[c.name] = (int(m.group(1)), "artifact", min_cost); continue
+            # "Equip costs you pay cost {N} less" (Puresteel Paladin, Sigarda's Aid variant)
+            m = re.search(r'equip\s+(?:costs?\s+(?:you\s+pay\s+)?)?(?:cost\s+)?\{(\d+)\}\s+less', oracle)
+            if m:
+                activated_cost_reduction_cache[c.name] = (int(m.group(1)), "equip", min_cost); continue
+
         # ---- EQUIPMENT DETECTION ----
         equip_cache = {}
         for c in all_copy_check:
@@ -2858,7 +3679,55 @@ class SimEngine:
             elif re.search(r'(?:\{t\}|tap)[^.]*?add\s+(?:an\s+amount|mana\s+equal)', oracle):
                 mana_dork_cache[c.name] = 2  # scaling dorks estimated at 2
 
+        # ---- SPELL TREASURE DETECTION ----
+        # Instants/sorceries that create Treasure tokens (one-shot mana)
+        # These are skipped by treasure_create_cache (which only tracks permanents)
+        spell_treasure_cache = {}  # card_name -> number_of_treasures
+        nw_map_st = {"a":1,"an":1,"one":1,"two":2,"three":3,"four":4,"five":5}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            if "treasure" not in oracle or "create" not in oracle:
+                continue
+            m_tr = re.search(r'create\s+(\w+)\s+treasure', oracle)
+            if m_tr:
+                w = m_tr.group(1)
+                spell_treasure_cache[c.name] = nw_map_st.get(w, int(w) if w.isdigit() else 1)
+
         treasure_create_cache = {}
+        # ---- RITUAL / ONE-SHOT MANA DETECTION (ultra-tight) ----
+        # Only simple rituals: Instant/Sorcery whose primary effect is adding mana.
+        # Safety: skip any card with draw/search/exile/destroy (multi-effect cards).
+        ritual_cache = {}  # card_name -> net_mana_gained
+        for c in all_copy_check:
+            tl = (c.type_line or "").lower()
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            oracle = (c.oracle_text or "").lower()
+            if not oracle or "add" not in oracle:
+                continue
+            # Skip multi-effect cards — these aren't pure rituals
+            if any(kw in oracle for kw in ("draw", "search", "exile the top", "destroy",
+                                           "create", "return", "counter target", "damage")):
+                continue
+            # Count mana symbols in "Add {X}{X}..." clauses
+            add_match = re.findall(r'add\s+(\{[^}]+\}(?:\{[^}]+\})*)', oracle)
+            if not add_match:
+                continue
+            total_produced = 0
+            for add_part in add_match:
+                syms = re.findall(r'\{([^}]+)\}', add_part)
+                for s in syms:
+                    if s.upper() in ('W', 'U', 'B', 'R', 'G', 'C'):
+                        total_produced += 1
+                    elif s.isdigit():
+                        total_produced += int(s)
+            net = total_produced - int(c.cmc)
+            if net > 0:
+                ritual_cache[c.name] = net
+
         for c in all_copy_check:
             oracle = (c.oracle_text or "").lower()
             if "treasure" not in oracle:
@@ -2871,7 +3740,7 @@ class SimEngine:
                 m2 = re.search(r'create\s+(\w+)\s+treasure', oracle)
                 w = m2.group(1) if m2 else "a"
                 treasure_create_cache[c.name] = ("etb", nw_map.get(w, int(w) if w.isdigit() else 1))
-            elif re.search(r'whenever\s+you\s+cast\s+(?:a|an)\s+\w*\s*spell[^.]*?treasure', oracle):
+            elif re.search(r'whenever\s+you\s+cast\s+(?:or\s+copy\s+)?(?:a|an)\s+[\w\s]*?spell[^.]*?treasure', oracle):
                 treasure_create_cache[c.name] = ("cast", 1)
             elif re.search(r'whenever\s+an?\s+opponent', oracle) and "treasure" in oracle:
                 treasure_create_cache[c.name] = ("opponent_cast", 1)
@@ -3061,6 +3930,358 @@ class SimEngine:
             n_phyrexian = len(re.findall(r'\{[WUBRG]/P\}', mc))
             if n_phyrexian > 0:
                 phyrexian_reduction[c.name] = n_phyrexian
+
+        # ---- RAMP SORCERY DETECTION ----
+        # Sorceries/instants that search for lands and put them on battlefield
+        # These are Ramp-category spells that don't stay on battlefield
+        ramp_spell_cache = {}  # card_name -> (n_lands_to_bf, n_lands_to_hand)
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            land_types = r'(?:land|forest|plains|island|swamp|mountain)'
+            # "up to two lands, put them onto the battlefield"
+            if re.search(r'up to two.*?' + land_types + r'.*?put them onto the battlefield', oracle):
+                ramp_spell_cache[c.name] = (2, 0)
+            # "up to two lands, put one onto the battlefield ... other into your hand"
+            elif re.search(r'up to two.*?' + land_types + r'.*?put one onto the battlefield.*?(?:other|second).*?(?:hand|on top)', oracle):
+                ramp_spell_cache[c.name] = (1, 1)
+            # "for a land, put it onto the battlefield"
+            elif re.search(r'(?:for a|for an?).*?' + land_types + r'.*?(?:put it|put that card) onto the battlefield', oracle):
+                ramp_spell_cache[c.name] = (1, 0)
+            # Generic: any "search library for land" + "battlefield" on a Ramp card
+            elif c.category == "Ramp" and re.search(r'search.*?library.*?' + land_types, oracle) and "battlefield" in oracle:
+                ramp_spell_cache[c.name] = (1, 0)
+
+        # ---- PUMP SPELL DETECTION ----
+        # Instant/sorcery that temporarily buff creatures
+        # Overrun: all creatures get +N/+N
+        # Giant Growth: target creature gets +N/+N
+        pump_spell_cache = {}  # card_name -> (mode, power_buff, per_creature)
+        # mode: "all" (all creatures), "target" (one creature), "x_all" (X-based all)
+        pump_etb_cache = {}  # creatures with ETB pump (Craterhoof, End-Raze Forerunners)
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            # Creature with ETB pump: "when ~ enters, creatures get +X/+X"
+            if "creature" in tl:
+                if re.search(r'when.*?enters.*?creatures?\s+you\s+control.*?get\s+\+(\d+)/\+\d+', oracle):
+                    m_etb = re.search(r'get\s+\+(\d+)/\+\d+', oracle)
+                    if m_etb:
+                        pump_etb_cache[c.name] = ("all", int(m_etb.group(1)))
+                elif re.search(r'when.*?enters.*?creatures?\s+you\s+control.*?\+x/\+x.*?(?:number|count)', oracle):
+                    pump_etb_cache[c.name] = ("x_all", 0)
+                continue  # don't also check as spell
+            if "instant" not in tl and "sorcery" not in tl:
+                continue
+            # "creatures you control get +N/+N" — Overrun, Triumph of the Hordes
+            m_all = re.search(r'creatures?\s+you\s+control\s+get\s+\+(\d+)/\+\d+', oracle)
+            if m_all:
+                pump_spell_cache[c.name] = ("all", int(m_all.group(1)), True)
+                continue
+            # "creatures you control get +X/+X where X is the number of creatures"
+            if re.search(r'creatures?\s+you\s+control.*?get\s+\+x/\+x.*?(?:number|count)', oracle):
+                pump_spell_cache[c.name] = ("x_all", 0, True)
+                continue
+            # "target creature gets +N/+N until end of turn"
+            m_tgt = re.search(r'target\s+creature\s+gets?\s+\+(\d+)/\+\d+\s+until', oracle)
+            if m_tgt:
+                pump_spell_cache[c.name] = ("target", int(m_tgt.group(1)), False)
+                continue
+            # "target creature gets +X/+X" (Become Immense, etc.)
+            if re.search(r'target\s+creature\s+gets?\s+\+(\d+)/\+\d+', oracle):
+                m2 = re.search(r'\+(\d+)/\+\d+', oracle)
+                if m2:
+                    pump_spell_cache[c.name] = ("target", int(m2.group(1)), False)
+
+        # ---- ESCAPE DETECTION ----
+        # Escape: cast from graveyard for escape cost + exile N cards from GY
+        escape_cache = {}  # card_name -> escape_cost (mana)
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_esc = re.search(r'escape[^.]*?\{([^}]*)\}(?:\{([^}]*)\})*.*?exile\s+(\w+)\s+(?:other\s+)?cards?\s+from\s+your\s+graveyard', oracle)
+            if m_esc:
+                cost_str = m_esc.group(1) + (m_esc.group(2) or "")
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                escape_cache[c.name] = sum(int(nn) for nn in nums) + pips
+
+        # ---- FORETELL DETECTION ----
+        # Foretell: pay {2} to exile face-down, cast later for foretell cost
+        # Sim shortcut: reduce effective CMC since total mana is spread across turns
+        foretell_cache = {}  # card_name -> foretell_cast_cost
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_ft = re.search(r'foretell\s+\{([^}]*)\}', oracle)
+            if m_ft:
+                cost_str = m_ft.group(1)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                foretell_cache[c.name] = sum(int(nn) for nn in nums) + pips
+
+        # ---- BLITZ DETECTION ----
+        # Blitz: alternative cost, creature gains haste, draw on death, sacrifice at EOT
+        # Sim: treat as a hasty creature that cantrips (draws 1 card)
+        blitz_cache = {}  # card_name -> blitz_cost
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_bl = re.search(r'blitz\s+\{([^}]*)\}', oracle)
+            if m_bl:
+                cost_str = m_bl.group(1)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                blitz_cache[c.name] = sum(int(nn) for nn in nums) + pips
+
+        # ---- SPECTACLE DETECTION ----
+        # Spectacle: cheaper alternative cost when an opponent lost life this turn.
+        # In goldfish, opponents take combat damage from T3+ → spectacle always on.
+        spectacle_cache = {}  # card_name -> spectacle_cost
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_sp = re.search(r'spectacle\s+\{([^}]*)\}', oracle)
+            if m_sp:
+                cost_str = m_sp.group(1)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                spectacle_cache[c.name] = sum(int(nn) for nn in nums) + pips
+
+        # ---- PROWL DETECTION ----
+        # Prowl {cost}: alternative cheaper cost when a creature of matching type
+        # dealt combat damage this turn. In goldfish from T3+, always active.
+        # Works like spectacle but tied to creature types (Rogues, Goblins, etc.)
+        prowl_cache = {}  # card_name -> prowl_cost
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_pr = re.search(r'prowl\s+\{([^}]*)\}', oracle)
+            if m_pr:
+                cost_str = m_pr.group(1)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                prowl_cache[c.name] = sum(int(nn) for nn in nums) + pips
+
+        # ---- CYCLING DETECTION ----
+        # Cycling {cost}: discard this card, draw a card.
+        # When a card is too expensive to cast, cycling is a cantrip at cycling cost.
+        # cycling_cache: card_name -> cycling_cost (mana to cycle)
+        cycling_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_cyc = re.search(r'cycling\s+\{([^}]*)\}', oracle)
+            if m_cyc:
+                cost_str = m_cyc.group(1)
+                # Skip cycling {X} (variable, can't estimate)
+                if 'x' in cost_str.lower():
+                    continue
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                cycling_cache[c.name] = max(sum(int(nn) for nn in nums) + pips, 1)
+
+        # ---- SCRY / SURVEIL DETECTION ----
+        # Detect "scry N" or "surveil N" on cards for draw quality improvement.
+        # scry_on_cast_cache: card_name -> scry_amount (fires when cast)
+        scry_on_cast_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_scry = re.search(r'(?:scry|surveil)\s+(\w+)', oracle)
+            if m_scry:
+                w = m_scry.group(1)
+                n_scry = {"one":1,"two":2,"three":3,"four":4,"five":5}.get(w, int(w) if w.isdigit() else 1)
+                # Only count as on-cast if it's a spell effect or ETB, not a repeating trigger
+                tl = (c.type_line or "").lower()
+                if "instant" in tl or "sorcery" in tl:
+                    scry_on_cast_cache[c.name] = n_scry
+                elif re.search(r'when.*?enters.*?(?:scry|surveil)', oracle):
+                    scry_on_cast_cache[c.name] = n_scry
+                elif re.search(r'(?:scry|surveil)\s+\d', oracle) and not re.search(r'whenever|beginning|at the', oracle):
+                    scry_on_cast_cache[c.name] = n_scry
+
+        # ---- PERSISTENT TOPDECK MANIPULATION ----
+        # Cards on the battlefield that let you scry/rearrange every turn.
+        # persistent_scry_cache: card_name -> scry_amount (fires each turn while on BF)
+        persistent_scry_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "instant" in tl or "sorcery" in tl:
+                continue  # only permanents have persistent effects
+
+            # "look at the top N cards...put them back in any order" (repeating)
+            # Mirri's Guile, Cream of the Crop, Soothsaying
+            if re.search(r'(?:beginning|upkeep|end\s+step|whenever)', oracle):
+                m_look = re.search(r'look\s+at\s+the\s+top\s+(\w+)\s+cards?', oracle)
+                if m_look:
+                    w = m_look.group(1)
+                    n_look = {"one":1,"two":2,"three":3,"four":4,"five":5}.get(w, int(w) if w.isdigit() else 3)
+                    persistent_scry_cache[c.name] = n_look
+                    continue
+
+            # Activated scry: "{cost}, {T}: Scry N" (Crystal Ball, Sensei's Top)
+            if re.search(r'\{[^}]*\}[^:]*?:\s*[^.]*?(?:scry|surveil)\s+(\w+)', oracle):
+                m_scry = re.search(r'(?:scry|surveil)\s+(\w+)', oracle)
+                if m_scry:
+                    w = m_scry.group(1)
+                    n_scry = {"one":1,"two":2,"three":3,"four":4,"five":5}.get(w, int(w) if w.isdigit() else 2)
+                    persistent_scry_cache[c.name] = n_scry
+                    continue
+
+            # Sensei's Divining Top: "{1}: Look at the top three cards"
+            # Soothsaying: "{X}: Look at the top X cards"
+            if re.search(r'\{[\dxX]\}\s*:\s*[^.]*?look\s+at\s+the\s+top', oracle):
+                m_look = re.search(r'top\s+(\w+)\s+cards?', oracle)
+                if m_look:
+                    w = m_look.group(1)
+                    n_look = {"one":1,"two":2,"three":3,"four":4,"five":5,"x":3}.get(w, int(w) if w.isdigit() else 3)
+                    persistent_scry_cache[c.name] = n_look
+                    continue
+
+            # "at the beginning of your upkeep/draw step...scry N" (repeating scry triggers)
+            if re.search(r'(?:beginning|upkeep|draw\s+step)[^.]*?(?:scry|surveil)\s+(\w+)', oracle):
+                m_scry = re.search(r'(?:scry|surveil)\s+(\w+)', oracle)
+                if m_scry:
+                    w = m_scry.group(1)
+                    n_scry = {"one":1,"two":2,"three":3,"four":4,"five":5}.get(w, int(w) if w.isdigit() else 1)
+                    persistent_scry_cache[c.name] = n_scry
+                    continue
+
+            # "look at the top card...any time" + "play/cast from the top" (Augur of Autumn, Courser)
+            if re.search(r'look\s+at\s+the\s+top\s+card.*?any\s+time', oracle):
+                persistent_scry_cache[c.name] = 1
+                continue
+            if re.search(r'(?:play|cast)\s+(?:lands?|spells?|cards?|the\s+top\s+card)\s+from\s+the\s+top\s+of\s+your\s+library', oracle):
+                if c.name not in persistent_scry_cache:
+                    persistent_scry_cache[c.name] = 1
+                    continue
+
+        # ---- SUSPEND DETECTION ----
+        # Suspend N—{cost}: exile from hand, add N time counters, cast for free when last removed.
+        # Cards with suspend often have CMC 0 (can't be cast normally — e.g. Ancestral Vision).
+        # Sim: treat as castable at suspend_cost mana, but delayed by N turns from when drawn.
+        # suspend_cache: card_name -> (suspend_turns, suspend_cost)
+        suspend_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_sus = re.search(r'suspend\s+(\d+)\s*(?:—|[-–])\s*\{([^}]*)\}', oracle)
+            if m_sus:
+                sus_turns = int(m_sus.group(1))
+                cost_str = m_sus.group(2)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                sus_cost = sum(int(nn) for nn in nums) + pips
+                suspend_cache[c.name] = (sus_turns, sus_cost)
+
+        # ---- AFFINITY DETECTION ----
+        # Affinity for artifacts: costs {1} less per artifact you control.
+        # Also detect affinity for other types (tokens, enchantments — rare but exists).
+        affinity_cache = {}  # card_name -> type_to_count ("artifact", "creature", etc.)
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            m_aff = re.search(r'affinity\s+for\s+(\w+)', oracle)
+            if m_aff:
+                affinity_cache[c.name] = m_aff.group(1)  # "artifacts", "creatures", etc.
+
+        # ---- CONNIVE DETECTION ----
+        # Connive: draw N, discard N, put a +1/+1 counter for each nonland discarded.
+        # Net 0 cards but improves card quality + adds counters.
+        # connive_cache: card_name -> estimated connive count per trigger
+        connive_cache = {}
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "creature" not in tl:
+                continue
+            if "connive" not in oracle:
+                continue
+            # "connives X" where X = number of attacking creatures (Raffine)
+            if re.search(r'connives?\s+x', oracle):
+                connive_cache[c.name] = -1  # -1 = variable, resolve at combat
+            # "connives" or "connive N"
+            elif re.search(r'connives?\s*(\d)?', oracle):
+                m_cn = re.search(r'connives?\s+(\d+)', oracle)
+                connive_cache[c.name] = int(m_cn.group(1)) if m_cn else 1
+
+        # ---- REBOUND DETECTION ----
+        # Rebound: after cast, exile instead of GY, cast again for free next turn.
+        # Model as: spell draws/damage happen twice (once now, once next turn).
+        # rebound_cards: set of card names with rebound keyword
+        rebound_cards = set()
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if ("instant" in tl or "sorcery" in tl) and re.search(r'\brebound\b', oracle):
+                rebound_cards.add(c.name)
+
+        # ---- MENTOR DETECTION ----
+        # Mentor: whenever this creature attacks, put a +1/+1 counter on an
+        # attacking creature with lesser power.
+        # Training: similar — whenever this attacks with a creature with greater power.
+        # Both add 1 counter per attack → model as 1 counter per turn from T3.
+        mentor_training_cache = set()
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "creature" not in tl:
+                continue
+            if re.search(r'\b(?:mentor|training)\b', oracle):
+                mentor_training_cache.add(c.name)
+
+        # ---- MYRIAD DETECTION ----
+        # Myriad: when this creature attacks, create token copies attacking each other opponent.
+        # In Commander (3 opponents), this triples the creature's combat damage.
+        # Also detect equipment/auras that grant myriad.
+        myriad_cache = set()
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            if re.search(r'\bmyriad\b', oracle):
+                myriad_cache.add(c.name)
+
+        # ---- DASH DETECTION ----
+        # Dash {cost}: alternative cost, creature gains haste, returns to hand at EOT.
+        # In goldfish: haste is always good, returning to hand means we recast each turn.
+        # Model: use dash cost as alternative in effective_cmc, creature has haste.
+        dash_cache = {}  # card_name -> dash_cost
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            tl = (c.type_line or "").lower()
+            if "creature" not in tl:
+                continue
+            m_dash = re.search(r'dash\s+\{([^}]*)\}', oracle)
+            if m_dash:
+                cost_str = m_dash.group(1)
+                nums = re.findall(r'(\d+)', cost_str)
+                pips = len(re.findall(r'[wubrgc]', cost_str))
+                dash_cache[c.name] = sum(int(nn) for nn in nums) + pips
+        # Dash creatures have haste when dashed
+        haste_creatures.update(dash_cache.keys())
+
+        # ---- FOOD / CLUE / BLOOD TOKEN DETECTION ----
+        # Detect artifacts/enchantments that create Food/Clue/Blood tokens
+        # Resolution: Clue = draw, Food = 3 life, Blood = rummage (≈ draw 0.5)
+        utility_token_cache = {}  # card_name -> (token_type, trigger_event)
+        for c in all_copy_check:
+            oracle = (c.oracle_text or "").lower()
+            for tok_type in ("clue", "food", "blood", "treasure"):
+                if f"create a {tok_type}" in oracle or f"create {tok_type}" in oracle:
+                    # Determine trigger
+                    if re.search(r'when.*?enters', oracle):
+                        utility_token_cache[c.name] = (tok_type, "etb")
+                    elif re.search(r'whenever.*?cast', oracle):
+                        utility_token_cache[c.name] = (tok_type, "cast")
+                    elif re.search(r'(?:beginning|upkeep|end\s+step)', oracle):
+                        utility_token_cache[c.name] = (tok_type, "upkeep")
+                    elif "investigate" in oracle:
+                        utility_token_cache[c.name] = ("clue", "cast")
+                    break
+            # "investigate" keyword without explicit "create a clue"
+            if c.name not in utility_token_cache and "investigate" in oracle:
+                if re.search(r'when.*?enters', oracle):
+                    utility_token_cache[c.name] = ("clue", "etb")
+                elif re.search(r'whenever.*?(?:land|creature|cast)', oracle):
+                    utility_token_cache[c.name] = ("clue", "cast")
+                elif re.search(r'(?:beginning|upkeep)', oracle):
+                    utility_token_cache[c.name] = ("clue", "upkeep")
+                else:
+                    utility_token_cache[c.name] = ("clue", "cast")
 
         # ---- KICKER DETECTION ----
         # Kicker: pay additional cost for enhanced effect
@@ -3406,18 +4627,86 @@ class SimEngine:
                 else:
                     experience_cache[c.name] = ("cast_any", "generic")
 
+        # ---- TOKEN NAME SWEEP ----
+        # Populate token_name_cache for any card that creates tokens but isn't in it yet
+        # (ETB creators, combat creators, treasure sources, commanders, keyword creators)
+        _token_keywords = ("create", "token", "investigate", "amass", "fabricate", "populate", "incubate")
+        all_token_check = list(cards) + (commanders or [])
+        for c in all_token_check:
+            if c.name in token_name_cache:
+                continue
+            oracle = (c.oracle_text or "").lower()
+            if not any(kw in oracle for kw in _token_keywords):
+                continue
+            # Treasure sources
+            if c.name in treasure_create_cache or c.name in spell_treasure_cache:
+                token_name_cache[c.name] = "Treasure"
+                continue
+            if "treasure" in oracle and "create" in oracle:
+                token_name_cache[c.name] = "Treasure"
+                continue
+            token_name_cache[c.name] = _parse_token_type(oracle)
+
+        # Also cover trigger_cache cards that fire create_token actions
+        _oracle_by_name = {c.name: (c.oracle_text or "") for c in all_token_check}
+        for cname, triggers in trigger_cache.items():
+            if cname in token_name_cache:
+                continue
+            for ev, cond, act, param in triggers:
+                if act == "create_token":
+                    token_name_cache[cname] = _parse_token_type(_oracle_by_name.get(cname, ""))
+                    break
+
+        # Per-turn token type tracking (accumulated across all sims)
+        token_type_totals = {t: {} for t in range(turns + 1)}  # turn -> {type: cumul_count}
+
         for i in range(n):
             sh = random.sample(deck, len(deck))
+            # ---- LONDON MULLIGAN ----
+            # Draw 7, evaluate hand. If bad (0-1 lands or 6+ lands), mulligan.
+            # On mulligan: reshuffle, draw 7, bottom N (where N = mulligan count).
+            # Bottom the least useful cards (highest CMC non-lands, or excess lands).
             hand = list(sh[:7]); lib = list(sh[7:])
+            mulligans = 0
+            max_mulls = 3  # allow up to mull to 4
+            while mulligans < max_mulls:
+                n_lands = sum(1 for c in hand if c.category == "Land")
+                # Keep criteria (progressively more lenient):
+                if mulligans == 0:
+                    keep = 2 <= n_lands <= 5
+                elif mulligans == 1:
+                    keep = 1 <= n_lands <= 5
+                else:
+                    keep = n_lands >= 1  # accept almost anything with a land
+                if keep:
+                    break
+                # Mulligan: reshuffle and draw 7 again
+                mulligans += 1
+                sh = random.sample(deck, len(deck))
+                hand = list(sh[:7]); lib = list(sh[7:])
+            # Bottom N cards (London mulligan: put N on bottom of library)
+            if mulligans > 0:
+                # Sort hand: bottom the worst cards first
+                # Priority to bottom: goldfish-dead > highest CMC non-lands > excess lands
+                hand.sort(key=lambda c: (
+                    0 if c.name in goldfish_dead else 1,  # dead cards bottom first
+                    0 if c.category in ("Protection", "Removal") else 1,  # reactive cards next
+                    -int(c.cmc) if c.category != "Land" else 100,  # expensive non-lands next
+                ))
+                for _ in range(mulligans):
+                    if hand:
+                        lib.append(hand.pop(0))  # bottom the worst card
             battlefield = []; graveyard = []
             turn_bonus = 0
             extra_land_sources = 0  # how many extra land drops from permanents in play
             sim_combo_found = [None] * n_combos  # first turn each combo assembled (None = never)
             sim_cumul_dmg = 0  # cumulative combat damage across turns
             sim_total_tokens = 0  # cumulative tokens on battlefield
+            sim_token_types = {}  # cumulative {type_name: count} on battlefield
             sim_total_counters = 0  # cumulative +1/+1 counters on creatures
             sim_alt_win_turn = None  # first turn an alt win condition is met (None = never)
             sim_life = 40  # player life total (for life-cost tracking and life-total wins)
+            sim_life_spent = 0  # cumulative life paid (draw engines, Yawgmoth, painlands)
             sim_cumul_lifegain = 0  # cumulative life gained across all turns
             sim_cmdr_cumul_dmg = {}  # commander_name -> cumulative combat damage dealt
             sim_approach_casts = {}  # card_name -> number of times cast (for Approach of the Second Sun)
@@ -3425,13 +4714,20 @@ class SimEngine:
             cmdr_on_battlefield = set()  # track which commanders are on bf
             cmdr_tax = {cn: 0 for cn in cmdr_cmc}  # commander tax (increases by 2 each cast)
             sim_removal_cast = 0  # cumulative removal spells/effects used this game
+            sim_opp_milled = 0  # cumulative cards milled from opponents' libraries
             sim_treasures = 0  # treasure tokens (usable as mana)
             adventure_exile = []  # cards cast as adventures, waiting to be cast as creatures
             saga_turns = {}  # card_name -> turns_on_battlefield (for chapter tracking)
             sim_is_monarch = False  # monarch status (extra draw each turn)
             sim_experience = 0  # experience counters (Mizzix, Meren, etc.)
+            sim_kill_turn_1opp = None  # first turn one opponent dies (40 dmg OR 21 cmdr dmg)
+            sim_kill_turn_3opp = None  # first turn all 3 opponents die (120 dmg)
+            sim_mill_kill_1opp = None  # first turn one opponent milled out (99 cards)
+            sim_mill_kill_3opp = None  # first turn all 3 opponents milled out (297 cards)
             sim_bonus_turns = 0  # extra turns queued
             sim_pw_loyalty = {}  # planeswalker_name -> current loyalty
+            sim_suspended = []  # [(card, resolve_turn)] cards in suspend exile
+            sim_rebound = []  # cards exiled by rebound, free-cast next turn
 
 
             cs = Counter(c.category for c in hand)
@@ -3446,6 +4742,24 @@ class SimEngine:
                 if lib:
                     hand.append(lib.pop(0))
                     draws_this_turn += 1
+
+                # ---- RESOLVE SUSPENDED CARDS ----
+                # Suspended cards resolve when their time counters reach 0
+                suspend_free_ids = set()  # card ids that resolved from suspend (cast for free)
+                if sim_suspended:
+                    resolved = [(sc, rt) for sc, rt in sim_suspended if rt <= t]
+                    for sc_card, rt in resolved:
+                        sim_suspended.remove((sc_card, rt))
+                        hand.append(sc_card)
+                        suspend_free_ids.add(id(sc_card))
+
+                # ---- RESOLVE REBOUND SPELLS ----
+                # Rebound spells exiled last turn are free-cast this turn
+                if sim_rebound:
+                    for rb_card in sim_rebound:
+                        hand.append(rb_card)
+                        suspend_free_ids.add(id(rb_card))  # reuse free-cast mechanism
+                    sim_rebound.clear()
 
                 # Calculate available mana
                 land_count = sum(1 for c in battlefield if c.category == "Land")
@@ -3504,6 +4818,22 @@ class SimEngine:
                 for bc in battlefield:
                     if bc.name in firebending_cache:
                         mana += firebending_cache[bc.name]
+
+                # ---- MANA DOUBLERS / TRIPLERS ----
+                # Apply once to all tappable mana before treasures.
+                # Battlefield only has previous-turn permanents at this point.
+                if mana_multiplier_cache:
+                    for bc in battlefield:
+                        if bc.name in mana_multiplier_cache:
+                            mult = mana_multiplier_cache[bc.name]
+                            if mult == 3:
+                                mana *= 3
+                            elif mult == 2:
+                                mana *= 2
+                            elif mult == "add_1":
+                                mana += land_count  # +1 per land
+                            break  # only apply best doubler
+
                 # Treasure tokens as mana (consumed when spent)
                 mana += sim_treasures
                 spent = 0
@@ -3539,6 +4869,9 @@ class SimEngine:
 
                 def effective_cmc(card):
                     """Card effective CMC after cost reductions."""
+                    # Resolved suspend cards cast for free
+                    if id(card) in suspend_free_ids:
+                        return 0
                     base = int(card.cmc)
                     red = cost_red_total
                     # Phyrexian mana: pay 2 life instead of 1 colored mana per phyrexian pip
@@ -3571,21 +4904,128 @@ class SimEngine:
                                     and bc.category != "Ramp"  # ramp already tapping for mana
                                     and bc not in cards_to_cast)
                         after_red = max(after_red - n_art, 0)
+                    # Foretell: can cast for foretell cost (paid {2} earlier, amortized)
+                    if card.name in foretell_cache:
+                        after_red = min(after_red, foretell_cache[card.name])
+                    # Blitz: alternative cost (creature gains haste + draws on death)
+                    if card.name in blitz_cache:
+                        after_red = min(after_red, blitz_cache[card.name])
+                    # Spectacle: cheaper cost when opponent lost life (always on from T3 in goldfish)
+                    if card.name in spectacle_cache and t >= 3:
+                        after_red = min(after_red, spectacle_cache[card.name])
+                    # Prowl: cheaper cost when creature of matching type dealt damage (always on T3+)
+                    if card.name in prowl_cache and t >= 3:
+                        after_red = min(after_red, prowl_cache[card.name])
+                    # Suspend: CMC 0 cards with suspend can't be cast normally
+                    if card.name in suspend_cache:
+                        sus_turns, sus_cost = suspend_cache[card.name]
+                        if base == 0:
+                            return 99  # can't cast normally, must suspend
+                        else:
+                            # CMC > 0: can cast normally or suspend for less
+                            # Don't override here — suspend is handled separately
+                            pass
+                    # Affinity: costs {1} less per [type] you control
+                    if card.name in affinity_cache:
+                        aff_type = affinity_cache[card.name]
+                        # Singularize: "artifacts" -> "artifact"
+                        aff_type_s = aff_type.rstrip("s") if aff_type.endswith("s") else aff_type
+                        n_aff = sum(1 for bc in battlefield
+                                    if aff_type_s in (bc.type_line or "").lower())
+                        if aff_type_s in ("artifact", "creature"):
+                            n_aff += int(sim_total_tokens * 0.3)  # some tokens are artifacts
+                        after_red = max(after_red - n_aff, 0)
+                    # Dash: alternative cost with haste (creature stays on BF in sim)
+                    if card.name in dash_cache:
+                        after_red = min(after_red, dash_cache[card.name])
                     return after_red
 
                 # Play land(s) — including extra land drops from Exploration/Azusa
                 extra_land_sources = sum(1 for c in battlefield if c.name in extra_land_cards)
                 max_lands = 1 + extra_land_sources
                 lands_played_this_turn = 0
+                taplands_played_this_turn = 0
+                fetch_lands_triggered = 0  # landfall from fetch resolution
                 for _ in range(max_lands):
                     land_in_hand = [c for c in hand if c.category == "Land"]
-                    if land_in_hand:
+                    if not land_in_hand:
+                        # ---- LANDS FROM GRAVEYARD (Crucible/Ramunap) ----
+                        if lands_from_gy_cards:
+                            has_gy_enabler = any(bc.name in lands_from_gy_cards for bc in battlefield)
+                            if has_gy_enabler:
+                                gy_lands = [gc for gc in graveyard if gc.category == "Land"]
+                                if gy_lands:
+                                    chosen_gy = gy_lands[0]
+                                    graveyard.remove(chosen_gy)
+                                    battlefield.append(chosen_gy)
+                                    if chosen_gy.name not in tapland_cards:
+                                        mana += 1
+                                    else:
+                                        taplands_played_this_turn += 1
+                                    lands_played_this_turn += 1
+                                    continue
+                        break
+
+                    # Prefer: untapped non-fetch > fetch (untapped result) > tapland > fetch (tapped result)
+                    non_fetch_untapped = [c for c in land_in_hand
+                                          if c.name not in tapland_cards and c.name not in fetch_land_cache]
+                    fetch_untapped = [c for c in land_in_hand
+                                      if c.name in fetch_land_cache and not fetch_land_cache[c.name][1]]
+                    non_fetch_tapped = [c for c in land_in_hand
+                                        if c.name in tapland_cards and c.name not in fetch_land_cache]
+                    fetch_tapped = [c for c in land_in_hand
+                                    if c.name in fetch_land_cache and fetch_land_cache[c.name][1]]
+
+                    if non_fetch_untapped:
+                        chosen = non_fetch_untapped[0]
+                    elif fetch_untapped:
+                        chosen = fetch_untapped[0]
+                    elif non_fetch_tapped:
+                        chosen = non_fetch_tapped[0]
+                    elif fetch_tapped:
+                        chosen = fetch_tapped[0]
+                    else:
                         chosen = land_in_hand[0]
-                        hand.remove(chosen); battlefield.append(chosen)
-                        mana += 1
+
+                    hand.remove(chosen)
+
+                    if chosen.name in fetch_land_cache:
+                        # ---- FETCH LAND RESOLUTION ----
+                        # Sacrifice fetch → search lib for matching land → put on BF
+                        target_types, fetched_tapped = fetch_land_cache[chosen.name]
+                        graveyard.append(chosen)  # fetch goes to GY
+                        # Find first matching land in library
+                        fetched = None
+                        for lc in lib:
+                            if lc.category != "Land":
+                                continue
+                            ltl = (lc.type_line or "").lower()
+                            if any(bt in ltl for bt in target_types):
+                                fetched = lc
+                                break
+                        if not fetched:
+                            # Fallback: any land
+                            for lc in lib:
+                                if lc.category == "Land":
+                                    fetched = lc
+                                    break
+                        if fetched:
+                            lib.remove(fetched)
+                            battlefield.append(fetched)
+                            if fetched_tapped or fetched.name in tapland_cards:
+                                taplands_played_this_turn += 1
+                            else:
+                                mana += 1
+                            fetch_lands_triggered += 1
                         lands_played_this_turn += 1
                     else:
-                        break
+                        # Normal land play
+                        battlefield.append(chosen)
+                        if chosen.name not in tapland_cards:
+                            mana += 1
+                        else:
+                            taplands_played_this_turn += 1
+                        lands_played_this_turn += 1
 
                 # ---- CAST COMMANDER FROM COMMAND ZONE ----
                 # Commanders that aren't on battlefield can be cast if mana available
@@ -3609,6 +5049,14 @@ class SimEngine:
                 # Roll cast decisions once per card this turn
                 cards_to_cast = list(cmdr_cast_this_turn)  # include commanders just cast
                 castable = [c for c in hand if c.category != "Land" and effective_cmc(c) <= mana - spent]
+
+                # Ritual boost: if any castable rituals would produce net mana,
+                # expand castable to include spells enabled by that extra mana
+                if ritual_cache:
+                    ritual_bonus = sum(ritual_cache[c.name] for c in castable if c.name in ritual_cache)
+                    if ritual_bonus > 0:
+                        expanded_mana = mana - spent + ritual_bonus
+                        castable = [c for c in hand if c.category != "Land" and effective_cmc(c) <= expanded_mana]
 
                 # Track what's accessible this turn (hand + battlefield + commanders) for combo checks
                 accessible_names = set()
@@ -3677,6 +5125,8 @@ class SimEngine:
                                 combo_override = 0.35  # risky to expose, low priority
 
                     # Determine final cast probability
+                    if card.name in goldfish_dead:
+                        continue  # goldfish-dead: skip entirely
                     if combo_override is not None:
                         prob = combo_override
                     else:
@@ -3715,6 +5165,16 @@ class SimEngine:
                     gy_cost = max(gy_cost - cost_red_total, 0)
                     if gy_cost <= mana - spent:
                         cast_decisions.append((6, gy_cost, gc))  # between hand cards and flashback
+
+                # ---- ESCAPE FROM GRAVEYARD ----
+                if escape_cache:
+                    for gc in list(graveyard):
+                        if gc.name not in escape_cache:
+                            continue
+                        esc_cost = max(escape_cache[gc.name] - cost_red_total, 0)
+                        # Escape requires exiling other cards from GY (we approximate: need 3+ cards)
+                        if esc_cost <= mana - spent and len(graveyard) >= 4:
+                            cast_decisions.append((6, esc_cost, gc))
 
                 # ---- REANIMATION SPELL CASTING ----
                 # If a reanimation spell is in hand and there's a creature in graveyard, cast it
@@ -3793,6 +5253,63 @@ class SimEngine:
                                 continue  # can't pay colored pips
                         cards_to_cast.append(card)
                         spent += cost
+                        # Ritual: produces net positive mana for subsequent spells this turn
+                        if card.name in ritual_cache:
+                            mana += ritual_cache[card.name]
+
+                # ---- CYCLING WITH LEFTOVER MANA ----
+                # Cards too expensive to cast can be cycled (discard + draw 1) for cycling cost
+                # Lands with cycling: cycle when we've already played max lands this turn
+                if cycling_cache:
+                    remaining_mana = mana - spent
+                    for card in list(hand):
+                        if card.name not in cycling_cache:
+                            continue
+                        if card in (c for _, _, c in cast_decisions if c in cards_to_cast):
+                            continue  # already being cast normally
+                        cyc_cost = cycling_cache[card.name]
+                        # Decide if cycling is better than holding/playing the card
+                        is_land = card.category == "Land"
+                        if is_land:
+                            # Cycle excess lands only when max land drops used this turn
+                            if lands_played_this_turn < max_lands:
+                                continue  # can still play this land, don't cycle it
+                        else:
+                            # Non-land: only cycle if we can't cast it
+                            real_cost = effective_cmc(card)
+                            if real_cost <= remaining_mana:
+                                continue  # can afford to cast it, don't cycle
+                        if cyc_cost <= remaining_mana:
+                            hand.remove(card)
+                            graveyard.append(card)
+                            spent += cyc_cost
+                            remaining_mana -= cyc_cost
+                            # Draw 1 card (the cycling cantrip)
+                            if lib:
+                                hand.append(lib.pop(0))
+                                turn_bonus += 1
+                                draws_this_turn += 1
+                            break  # cycle at most 1 card per turn (conservative)
+
+                # ---- SUSPEND ACTIVATION ----
+                # Cards with suspend that can't be cast normally: pay suspend cost, exile
+                if suspend_cache:
+                    remaining_mana_sus = mana - spent
+                    for card in list(hand):
+                        if card.name not in suspend_cache:
+                            continue
+                        if id(card) in suspend_free_ids:
+                            continue  # this just resolved from suspend, don't re-suspend
+                        sus_turns, sus_cost = suspend_cache[card.name]
+                        normal_cost = int(card.cmc)
+                        # Suspend if: can't cast normally (CMC 0 or too expensive) and can pay suspend cost
+                        should_suspend = (normal_cost == 0 or normal_cost > remaining_mana_sus)
+                        if should_suspend and sus_cost <= remaining_mana_sus:
+                            hand.remove(card)
+                            sim_suspended.append((card, t + sus_turns))
+                            spent += sus_cost
+                            remaining_mana_sus -= sus_cost
+                            break  # suspend at most 1 per turn
 
                 # ═══════════════════════════════════════════
                 # TRIGGER CHAIN RESOLUTION
@@ -3802,6 +5319,12 @@ class SimEngine:
                 #   lifegain, attack, end_step, upkeep, leave, damage_dealt
                 # ═══════════════════════════════════════════
                 tokens_created_this_turn = 0
+                token_type_this_turn = {}  # {type_name: count} for this turn
+
+                def _track_token_type(n, source_name):
+                    """Track N tokens by type from source card."""
+                    ttype = token_name_cache.get(source_name, "Token")
+                    token_type_this_turn[ttype] = token_type_this_turn.get(ttype, 0) + n
                 chain_draws = 0
                 chain_damage = 0
                 chain_lifegain = 0
@@ -3838,12 +5361,48 @@ class SimEngine:
                     if cond == "noncreature": return "creature" not in card_types
                     return cond in card_types
 
+                def _do_scry(n_scry):
+                    """Scry N: look at top N of library, bottom bad cards.
+                    Improves draw quality by removing dead/excess cards from top."""
+                    if not lib or n_scry <= 0:
+                        return
+                    n_look = min(n_scry, len(lib))
+                    to_bottom = []
+                    land_count_hand = sum(1 for c in hand if c.category == "Land")
+                    for j in range(n_look):
+                        card = lib[j]
+                        should_bottom = False
+                        # Always bottom goldfish-dead cards
+                        if card.name in goldfish_dead:
+                            should_bottom = True
+                        # Bottom excess lands when hand already has enough
+                        elif card.category == "Land" and land_count_hand >= 3:
+                            should_bottom = True
+                        # Bottom very expensive spells early game
+                        elif int(card.cmc) > mana + 3 and t <= 5:
+                            should_bottom = True
+                        if should_bottom:
+                            to_bottom.append(j)
+                    # Remove from top (reverse order to preserve indices)
+                    for j in reversed(to_bottom):
+                        lib.append(lib.pop(j))
+
+                # ---- PERSISTENT TOPDECK MANIPULATION ----
+                # Cards on BF that let you scry/rearrange each turn
+                # (Sensei's Divining Top, Mirri's Guile, Crystal Ball, etc.)
+                if persistent_scry_cache:
+                    for perm in battlefield:
+                        if perm.name in persistent_scry_cache and perm not in cards_to_cast:
+                            n_look = persistent_scry_cache[perm.name]
+                            _do_scry(n_look)
+
                 def score_blink_target(bp):
                     """Score a permanent for blink targeting based on ETB value."""
                     ev = etb_value_cache.get(bp.name, {})
                     sc = 0
                     for k, v in ev.items():
-                        if v == -1: v = 3  # estimate for scoring
+                        if v == -1: v = 3  # X-spell estimate
+                        if v <= -50 and v >= -54: v = 5  # devotion estimate (~5 pips typical)
                         if k == "tokens": sc += v * 3
                         elif k == "draw": sc += v * 4
                         elif k == "damage": sc += v * 2
@@ -3853,9 +5412,27 @@ class SimEngine:
                     return sc
 
                 def resolve_x(val, card_name):
-                    """Resolve X-dependent values: -1 sentinel → computed X value."""
+                    """Resolve X-dependent values: -1 sentinel → computed X value.
+                    Devotion sentinels: -50=W, -51=U, -52=B, -53=R, -54=G."""
                     if val == -1:
                         return x_values_this_turn.get(card_name, 3)  # fallback 3 if not cast this turn
+                    if val <= -50 and val >= -54:
+                        # Devotion: count colored pips on all BF permanents' mana costs
+                        color_pip = {-50: 'W', -51: 'U', -52: 'B', -53: 'R', -54: 'G'}[val]
+                        devotion = 0
+                        for bp in battlefield:
+                            mc = (bp.mana_cost or "").upper()
+                            devotion += mc.count("{" + color_pip + "}")
+                            # Hybrid pips like {B/G} count for both colors
+                            for hyb in re.findall(r'\{([^}]+)\}', mc):
+                                if '/' in hyb and color_pip in hyb.split('/'):
+                                    devotion += 1
+                        # Also count commander(s) on battlefield
+                        for cm in (commanders or []):
+                            if cm.name.lower() in cmdr_on_battlefield:
+                                mc = (cm.mana_cost or "").upper()
+                                devotion += mc.count("{" + color_pip + "}")
+                        return max(devotion, 1)  # minimum 1 (the creature itself has pips)
                     return val
 
                 def fire_etb_effects(cname, card_types, trigger_q, source="card"):
@@ -3948,6 +5525,10 @@ class SimEngine:
 
                         if act == "create_token":
                             tokens_created_this_turn += param
+                            _track_token_type(param, src)
+                            # Route treasure tokens to sim_treasures (usable as mana)
+                            if token_name_cache.get(src) == "Treasure":
+                                sim_treasures += param
                             creatures_entered_this_turn += param
                             # Tokens entering trigger creature_etb, artifact_etb, token_created, permanent_etb
                             for bp in battlefield:
@@ -4073,6 +5654,7 @@ class SimEngine:
                     is_cmdr = card in cmdr_cast_this_turn
                     is_flashback = (card in graveyard and card.name in flashback_cache)
                     is_gy_creature = (card in graveyard and card.name in gy_creature_cache)
+                    is_escape = (card in graveyard and card.name in escape_cache and not is_flashback and not is_gy_creature)
                     is_adventure_cast = False  # casting the adventure (spell) half
                     is_from_exile = card in adventure_exile  # casting creature from exile
 
@@ -4082,17 +5664,25 @@ class SimEngine:
                             # Cast as creature from exile — enters battlefield
                         elif is_flashback:
                             graveyard.remove(card)  # flashback: exile from graveyard
+                        elif is_escape:
+                            graveyard.remove(card)  # escape: remove from graveyard
+                            # Exile 3 other cards from GY as additional cost
+                            for _ in range(min(3, len(graveyard))):
+                                if graveyard:
+                                    graveyard.pop(0)
                         elif is_gy_creature:
                             graveyard.remove(card)  # GY creature recovery: exile from graveyard
                             gy_cost, gy_mode = gy_creature_cache[card.name]
                             if gy_mode in ("embalm", "eternalize"):
                                 # Create a token copy instead of entering creature itself
                                 tokens_created_this_turn += 1
+                                _track_token_type(1, card.name)
                                 creatures_entered_this_turn += 1
                                 continue  # don't process as normal creature
                             elif gy_mode == "encore":
                                 # Create 3 token copies (one per opponent in Commander)
                                 tokens_created_this_turn += 3
+                                _track_token_type(3, card.name)
                                 creatures_entered_this_turn += 3
                                 continue
                             # else: unearth — creature enters battlefield normally (handled below)
@@ -4120,6 +5710,7 @@ class SimEngine:
                                     turn_bonus += 1
                         elif adv_eff == "token":
                             tokens_created_this_turn += adv_param
+                            _track_token_type(adv_param, card.name)
                         elif adv_eff == "ramp":
                             # Search for a land and put it on battlefield
                             land_idx = next((j for j, lc in enumerate(lib) if lc.category == "Land"), None)
@@ -4133,7 +5724,10 @@ class SimEngine:
                         if is_permanent or is_from_exile:
                             battlefield.append(card)
                         elif not is_flashback:
-                            graveyard.append(card)  # normal I/S -> graveyard
+                            if card.name in rebound_cards:
+                                sim_rebound.append(card)  # exile for free cast next turn
+                            else:
+                                graveyard.append(card)  # normal I/S -> graveyard
                         # flashback cards are exiled (don't go back to graveyard)
 
                     if "creature" in card_types:
@@ -4144,6 +5738,14 @@ class SimEngine:
                             sim_total_counters += x_counters
                             # Update power cache to reflect actual power (X/X instead of 0/0)
                             power_cache[card.name] = x_counters
+                        # Pump ETB: Craterhoof, End-Raze Forerunners
+                        if card.name in pump_etb_cache:
+                            pe_mode, pe_buff = pump_etb_cache[card.name]
+                            n_cr_now = sum(1 for bc in battlefield if "creature" in (bc.type_line or "").lower()) + int(sim_total_tokens)
+                            if pe_mode == "all":
+                                chain_damage += pe_buff * max(n_cr_now, 1)
+                            elif pe_mode == "x_all":
+                                chain_damage += n_cr_now * max(n_cr_now, 1)
 
                     # ---- REANIMATION RESOLUTION ----
                     # If this is a reanimate spell, move best creature from GY to battlefield
@@ -4169,6 +5771,59 @@ class SimEngine:
                                 if rean_q:
                                     resolve_queue(rean_q)
 
+                    # ---- RAMP SORCERY RESOLUTION ----
+                    # Ramp spells (sorceries/instants) that search library for land
+                    if card.name in ramp_spell_cache and not is_permanent:
+                        n_bf, n_hand = ramp_spell_cache[card.name]
+                        for _ in range(n_bf):
+                            land_idx = next((j for j, lc in enumerate(lib) if lc.category == "Land"), None)
+                            if land_idx is not None:
+                                bf_land = lib.pop(land_idx)
+                                battlefield.append(bf_land)
+                                mana += 1
+                                lands_entered_this_turn += 1
+                        for _ in range(n_hand):
+                            land_idx = next((j for j, lc in enumerate(lib) if lc.category == "Land"), None)
+                            if land_idx is not None:
+                                hand.append(lib.pop(land_idx))
+
+                    # ---- PUMP SPELL RESOLUTION ----
+                    # Temporary power buffs from instant/sorcery spells
+                    if card.name in pump_spell_cache and not is_permanent:
+                        p_mode, p_buff, p_per_cr = pump_spell_cache[card.name]
+                        n_cr_now = sum(1 for bc in battlefield if "creature" in (bc.type_line or "").lower()) + int(sim_total_tokens)
+                        if p_mode == "all":
+                            # All creatures get +N — applied this turn only
+                            chain_damage += p_buff * max(n_cr_now, 1)
+                        elif p_mode == "x_all":
+                            # +X/+X where X = # creatures (Craterhoof-style)
+                            chain_damage += n_cr_now * max(n_cr_now, 1)
+                        elif p_mode == "target":
+                            # Target creature gets +N
+                            chain_damage += p_buff
+
+                    # ---- SPELL TREASURE RESOLUTION ----
+                    # I/S that create Treasure tokens → add to sim_treasures (usable as mana)
+                    if not is_permanent and card.name in spell_treasure_cache:
+                        n_tr = spell_treasure_cache[card.name]
+                        sim_treasures += n_tr
+                        _track_token_type(n_tr, card.name)
+
+                    # ---- SCRY ON CAST ----
+                    if card.name in scry_on_cast_cache:
+                        _do_scry(scry_on_cast_cache[card.name])
+
+                    # ---- OPPONENT MILL ON CAST ----
+                    if card.name in opp_mill_cache:
+                        mill_n, mill_trig = opp_mill_cache[card.name]
+                        if mill_trig == "cast":
+                            actual_mill = mill_n if mill_n > 0 else 3  # variable sentinel → estimate 3
+                            if mill_n == -2:
+                                actual_mill = 46  # "half library" ≈ 46 in Commander
+                            n_doublers_mill = sum(1 for bc in battlefield if bc.name in mill_doubler_cards)
+                            actual_mill *= (2 ** n_doublers_mill) if n_doublers_mill > 0 else 1
+                            sim_opp_milled += actual_mill
+
                     # ---- REMOVAL TRACKING ----
                     if card.category in ("Removal", "Board Wipe"):
                         sim_removal_cast += 1
@@ -4191,6 +5846,9 @@ class SimEngine:
                             sc += power_cache.get(bp.name, 0) * 2
                             # Prefer creatures with triggers
                             if bp.name in trigger_cache: sc += 5
+                            # STRONGLY prefer alt-win clone targets (Biovisionary)
+                            if bp.name in alt_win_cache and alt_win_cache[bp.name][0] == "clone_copies":
+                                sc += 100
                             if sc > best_clone_sc:
                                 best_clone_sc = sc; best_clone = bp
                         if best_clone:
@@ -4336,6 +5994,7 @@ class SimEngine:
                         if "creature" in card_types:
                             creatures_entered_this_turn += extra_copies
                             tokens_created_this_turn += extra_copies
+                            _track_token_type(extra_copies, card.name)
                         # Each token copy triggers the original's ETB effects
                         etb_effs = etb_value_cache.get(etb_source, {})
                         for _ in range(extra_copies):
@@ -4488,6 +6147,23 @@ class SimEngine:
                                         turn_bonus += 1
                                         draws_this_turn += 1
 
+                    # ---- BLITZ RESOLUTION ----
+                    # Blitz: creature gains haste, draws a card on death, sacrificed at EOT
+                    if card.name in blitz_cache and "creature" in card_types:
+                        blitz_cost = blitz_cache[card.name]
+                        # Was it cast for blitz cost? (cheaper than normal)
+                        if blitz_cost < int(card.cmc):
+                            # Draw a card (the blitz cantrip)
+                            if lib:
+                                hand.append(lib.pop(0))
+                                draws_this_turn += 1
+                                turn_bonus += 1
+                            # Creature has haste — add to set for this turn
+                            haste_creatures.add(card.name)
+                            # Creature will be sacrificed at EOT (approximation: -1 token equivalent)
+                            # We don't remove from BF since power calc already happened,
+                            # but next turn it won't be there. Track via tokens as proxy.
+
                     # ---- KICKER BONUS ----
                     if card.name in kicker_cache:
                         k_cost, k_eff, k_param = kicker_cache[card.name]
@@ -4495,6 +6171,7 @@ class SimEngine:
                             spent += k_cost  # pay kicker cost
                             if k_eff == "token":
                                 tokens_created_this_turn += k_param
+                                _track_token_type(k_param, card.name)
                             elif k_eff == "draw":
                                 for _ in range(k_param):
                                     if lib:
@@ -4535,6 +6212,7 @@ class SimEngine:
                             else:
                                 graveyard.append(mc)  # I/S -> GY after resolving
                             tokens_created_this_turn += etb_value_cache.get(mc.name, {}).get("tokens", 0)
+                            _track_token_type(etb_value_cache.get(mc.name, {}).get("tokens", 0), mc.name)
                             chain_damage += etb_value_cache.get(mc.name, {}).get("damage", 0)
                         for _ in range(wheel_draw):
                             if lib:
@@ -4564,6 +6242,7 @@ class SimEngine:
                             ttrig, tn = treasure_create_cache[bp.name]
                             if ttrig == "cast" and bp not in cards_to_cast:
                                 sim_treasures += tn
+                                _track_token_type(tn, bp.name)
 
                     # Track spell count for storm / scaling copies
                     spells_cast_this_turn += 1
@@ -4573,19 +6252,161 @@ class SimEngine:
                     if bc.name not in treasure_create_cache:
                         continue
                     ttrig, tn = treasure_create_cache[bc.name]
+                    tr_created = 0
                     if ttrig == "upkeep" and bc not in cards_to_cast:
-                        sim_treasures += tn
+                        tr_created = tn
                     elif ttrig == "landfall":
-                        sim_treasures += tn * lands_played_this_turn
+                        tr_created = tn * lands_played_this_turn
                     elif ttrig == "opponent_cast" and bc not in cards_to_cast:
-                        sim_treasures += tn * 2  # goldfish: opponents cast ~2 spells/turn
+                        tr_created = tn * 2  # goldfish: opponents cast ~2 spells/turn
                     elif ttrig == "etb" and bc in cards_to_cast:
-                        sim_treasures += tn
+                        tr_created = tn
+                    if tr_created > 0:
+                        sim_treasures += tr_created
+                        _track_token_type(tr_created, bc.name)
                 # Consume treasures spent on spells (approximate)
                 firebend_mana = sum(firebending_cache.get(bc.name, 0) for bc in battlefield)
                 base_mana = land_count + ramp_mana + board_bonus_mana + firebend_mana
                 treasure_spent = max(0, spent - base_mana)
                 sim_treasures = max(0, sim_treasures - treasure_spent)
+
+                # ---- OPPONENT MILL (repeating sources) ----
+                if opp_mill_cache:
+                    n_doublers_mill = sum(1 for bc in battlefield if bc.name in mill_doubler_cards)
+                    mill_mult = (2 ** n_doublers_mill) if n_doublers_mill > 0 else 1
+                    # Snapshot opponent GY before this turn's milling (for scaling effects)
+                    opp_gy_snapshot = sim_opp_milled
+                    activated_mill_done = set()  # track processed card names for activated abilities
+                    for bc in battlefield:
+                        if bc.name not in opp_mill_cache or bc in cards_to_cast:
+                            continue
+                        mill_n, mill_trig = opp_mill_cache[bc.name]
+                        actual_mill = mill_n if mill_n > 0 else 3
+                        if mill_n == -2:
+                            actual_mill = 46
+                        if mill_trig == "upkeep":
+                            sim_opp_milled += actual_mill * mill_mult
+                        elif mill_trig == "landfall":
+                            sim_opp_milled += actual_mill * lands_played_this_turn * mill_mult
+                        elif mill_trig == "attack" and t >= 3:
+                            sim_opp_milled += actual_mill * mill_mult
+                        elif mill_trig == "activated" and t >= 2:
+                            # Deduplicate: only count once per card name, scale by copies
+                            if bc.name in activated_mill_done:
+                                continue
+                            activated_mill_done.add(bc.name)
+                            n_copies = sum(1 for pc in battlefield if pc.name == bc.name and pc not in cards_to_cast)
+                            bc_oracle = (bc.oracle_text or "").lower()
+                            m_group_tap = re.search(r'tap\s+(four|three|two|five|six)\s+(\w+)', bc_oracle)
+                            if m_group_tap:
+                                # Group-tap ability (Persistent Petitioners: tap 4 advisors → mill 12)
+                                tap_n_word = m_group_tap.group(1)
+                                tap_type = m_group_tap.group(2).rstrip("s")  # "advisors" → "advisor"
+                                tap_n = {"two":2,"three":3,"four":4,"five":5,"six":6}.get(tap_n_word, 4)
+                                # Count all creatures of matching type (including commander)
+                                n_of_type = sum(1 for pc in battlefield
+                                    if tap_type in (pc.type_line or "").lower()
+                                    and pc not in cards_to_cast)
+                                n_group_acts = n_of_type // tap_n
+                                if n_group_acts > 0:
+                                    sim_opp_milled += actual_mill * n_group_acts * mill_mult
+                                else:
+                                    # Can't group-tap yet — use individual {cost}, {T}: mill 1 ability
+                                    # Find the smaller mill amount from oracle
+                                    all_mills = re.findall(r'mills?\s+(\w+)\s+cards?', bc_oracle)
+                                    individual_mill = 1
+                                    for w_m in all_mills:
+                                        v = nw_mill.get(w_m, int(w_m) if w_m.isdigit() else 0)
+                                        if 0 < v < actual_mill:
+                                            individual_mill = v
+                                            break
+                                    sim_opp_milled += individual_mill * n_copies * mill_mult
+                            else:
+                                # Individual tap: each copy activates once
+                                n_act = min(n_copies, max(1, int(mana - spent)))
+                                if n_act > 0:
+                                    sim_opp_milled += actual_mill * n_act * mill_mult
+                        elif mill_trig == "damage_dealt" and t >= 3:
+                            # Mindcrank: mill equal to life lost = combat damage
+                            combat_est = total_power if t >= 3 else 0
+                            sim_opp_milled += combat_est * mill_mult
+                        elif mill_trig == "draw" and bc not in cards_to_cast:
+                            # Psychic Corrosion / Sphinx's Tutelage: mill N per card drawn
+                            # draws_this_turn includes normal draw + bonus draws
+                            sim_opp_milled += actual_mill * draws_this_turn * mill_mult
+                        elif mill_trig == "permanent_etb":
+                            # Altar of the Brood: mill N per permanent entering
+                            permanents_entered = len(cards_to_cast) + tokens_created_this_turn
+                            sim_opp_milled += actual_mill * permanents_entered * mill_mult
+                        elif mill_trig == "whenever_cast" and bc not in cards_to_cast:
+                            # Consuming Aberration: mills per spell cast while on BF
+                            # Real text: "mills cards equal to the number of cards in THEIR graveyard"
+                            # Opponent's GY grows as we mill → snowball, but capped at 99 (library size)
+                            n_spells = max(len(cards_to_cast), 1)
+                            if mill_n < 0:
+                                # One opponent's GY = min(cards milled so far, 99)
+                                opp_gy = min(opp_gy_snapshot, 99)
+                                actual_mill = max(opp_gy, 3)
+                            sim_opp_milled += actual_mill * n_spells * mill_mult
+                        elif mill_trig == "opponent_cast" and bc not in cards_to_cast:
+                            # Memory Erosion: opponents cast ~2-3 spells/turn in goldfish
+                            sim_opp_milled += actual_mill * 2 * mill_mult
+                        elif mill_trig == "opponent_untap" and bc not in cards_to_cast:
+                            # Mesmeric Orb: opponents untap all permanents each turn
+                            # Estimate: opponents have ~(t+2) permanents on average
+                            opp_permanents = min(t + 2, 12)
+                            sim_opp_milled += actual_mill * opp_permanents * mill_mult
+                        elif mill_trig == "combat_per_creature" and t >= 3:
+                            # Per-creature combat damage mill — flat N per creature connecting
+                            n_connecting = sum(1 for pc in battlefield
+                                if "creature" in (pc.type_line or "").lower()
+                                and pc not in cards_to_cast) + max(int(sim_total_tokens - tokens_created_this_turn), 0)
+                            total_milled = actual_mill * max(n_connecting, 1) * mill_mult
+                            sim_opp_milled += total_milled
+                            # Bonus draw: "if a creature card is milled, draw a card"
+                            bc_oracle = (bc.oracle_text or "").lower()
+                            if re.search(r'(?:creature|nonland)\s+card\s+is\s+milled.*?draw', bc_oracle):
+                                est_creature_hits = int(total_milled * 0.35)
+                                for _ in range(est_creature_hits):
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                        draws_this_turn += 1
+                                        turn_bonus += 1
+                        elif mill_trig == "combat_per_damage" and t >= 3:
+                            # Per-DAMAGE combat mill (Anowon) — mills = damage dealt by each creature
+                            # Total mill = sum of all creature power connecting (= combat damage)
+                            rogue_power = 0
+                            anthem_buff_now = sum(anthem_cache.get(bcc.name, 0) for bcc in battlefield)
+                            for pc in battlefield:
+                                if "creature" in (pc.type_line or "").lower() and pc not in cards_to_cast:
+                                    rogue_power += power_cache.get(pc.name, 1) + anthem_buff_now
+                            # Add token creature power (~1 each + anthem)
+                            n_old_tokens = max(int(sim_total_tokens - tokens_created_this_turn), 0)
+                            rogue_power += n_old_tokens * (1 + anthem_buff_now)
+                            # Add +1/+1 counters spread across creatures
+                            rogue_power += sim_total_counters
+                            total_milled = max(rogue_power, 1) * mill_mult
+                            sim_opp_milled += total_milled
+                            # Bonus draw: "if the player mills at least one creature card, draw a card"
+                            # Per ruling: you draw EXACTLY ONE card, regardless of how many creatures milled
+                            # ~35% creature density → with N mills, P(>=1 creature) ≈ 1-0.65^N
+                            bc_oracle = (bc.oracle_text or "").lower()
+                            if re.search(r'(?:creature|nonland)\s+card.*?(?:is\s+milled|mills).*?draw', bc_oracle) or \
+                               re.search(r'mills?\s+(?:at\s+least\s+)?(?:one|a)\s+creature\s+card.*?draw', bc_oracle):
+                                hit_prob = 1.0 - (0.65 ** min(total_milled, 20))
+                                if random.random() < hit_prob and lib:
+                                    hand.append(lib.pop(0))
+                                    draws_this_turn += 1
+                                    turn_bonus += 1
+                    # ETB mill from cards cast THIS turn
+                    for cc in cards_to_cast:
+                        if cc.name in opp_mill_cache:
+                            mill_n, mill_trig = opp_mill_cache[cc.name]
+                            if mill_trig in ("etb", "permanent_etb"):
+                                actual_mill = mill_n if mill_n > 0 else 3
+                                if mill_n == -2:
+                                    actual_mill = 46
+                                sim_opp_milled += actual_mill * mill_mult
 
                 # ---- MONARCH EXTRA DRAW ----
                 if sim_is_monarch:
@@ -4792,10 +6613,12 @@ class SimEngine:
                             if lib: hand.append(lib.pop(0))
                         elif ab_action == "create_token":
                             tokens_created_this_turn += ab_param
+                            _track_token_type(ab_param, bc.name)
                         elif ab_action == "create_token_copy":
                             # Copy best creature/artifact on board
                             # Token count +1, and add bonus power for the copied creature's stats
                             tokens_created_this_turn += 1
+                            _track_token_type(1, bc.name)
                             if best_bf_power > 1 and t >= 3:
                                 chain_damage += best_bf_power - 1  # bonus over base 1/1
                         elif ab_action == "create_tokens_count_top":
@@ -4803,10 +6626,12 @@ class SimEngine:
                             # With manipulation, arranged top gives better CMC
                             tok_count = topdeck_quality_cmc if topdeck_manipulation_count >= 2 else int(avg_nonland_cmc)
                             tokens_created_this_turn += max(tok_count, 1)
+                            _track_token_type(max(tok_count, 1), bc.name)
                         elif ab_action == "create_token_power_top":
                             # One token with P/T = top card's CMC (Garruk pattern)
                             tok_power = topdeck_quality_cmc if topdeck_manipulation_count >= 2 else int(avg_nonland_cmc)
                             tokens_created_this_turn += 1
+                            _track_token_type(1, bc.name)
                             # Bonus combat power beyond the base 1/1 that tokens are tracked as
                             chain_damage += max(tok_power - 1, 0) * (1 if t >= 3 else 0)
                         elif ab_action == "damage":
@@ -4834,7 +6659,7 @@ class SimEngine:
                             # Temporary anthem for this turn's combat
                             anthem_buff += ab_param
                         elif ab_action == "scry":
-                            pass  # scry improves draw quality — modeled via topdeck quality
+                            _do_scry(ab_param)  # scry improves draw quality
                         elif ab_action == "mill":
                             for _ in range(min(ab_param, len(lib))):
                                 graveyard.append(lib.pop(0))
@@ -4885,9 +6710,20 @@ class SimEngine:
                 # ---- ACTIVATED BLINK LOOPS ----
                 # Deadeye Navigator etc.: spend mana to blink repeatedly
                 remaining_mana = mana - spent
+                # Calculate activated ability cost reduction for blink/equip
+                act_cost_red_blink = 0
+                act_cost_floor = 1  # default floor (most reducers can't go below 1)
+                for bc in battlefield:
+                    if bc.name in activated_cost_reduction_cache:
+                        amt, tgt, min_cost = activated_cost_reduction_cache[bc.name]
+                        if tgt in ("any", "creature"):
+                            act_cost_red_blink += amt
+                            # If ANY reducer allows floor 0, use it; otherwise stay at 1
+                            if min_cost == 0:
+                                act_cost_floor = 0
                 for bp in battlefield:
                     if bp.name in activated_blink_cache and bp not in cards_to_cast:
-                        blink_cost = activated_blink_cache[bp.name]
+                        blink_cost = max(activated_blink_cache[bp.name] - act_cost_red_blink, act_cost_floor)
                         # Find best ETB target using full scoring
                         best_target = None; best_sc = 0
                         for bt in battlefield:
@@ -4912,6 +6748,7 @@ class SimEngine:
                                 # Queue all ETB effects per blink
                                 if blink_tokens > 0:
                                     tokens_created_this_turn += blink_tokens
+                                    _track_token_type(blink_tokens, best_target.name)
                                 if etb_effs.get("draw", 0) > 0:
                                     for _ in range(etb_effs["draw"]):
                                         if lib:
@@ -4933,12 +6770,15 @@ class SimEngine:
                             remaining_mana = max(0, available)
 
                 # ---- FIRE LANDFALL TRIGGERS ----
-                # Lands played this turn trigger landfall
-                n_lands_played = sum(1 for c in cards_to_cast if "land" in (c.type_line or "").lower())
-                if n_lands_played > 0:
-                    lands_entered_this_turn += n_lands_played
+                # All lands entering this turn trigger landfall:
+                # - Lands played from hand (lands_played_this_turn)
+                # - Lands from ramp spells in cards_to_cast
+                n_ramp_lands = sum(1 for c in cards_to_cast if "land" in (c.type_line or "").lower())
+                total_landfall = lands_played_this_turn + n_ramp_lands
+                if total_landfall > 0:
+                    lands_entered_this_turn += total_landfall
                     landfall_q = []
-                    fire_landfall_triggers(n_lands_played, landfall_q)
+                    fire_landfall_triggers(total_landfall, landfall_q)
                     resolve_queue(landfall_q)
 
                 # ---- SAGA CHAPTER RESOLUTION ----
@@ -4965,6 +6805,7 @@ class SimEngine:
                                             draws_this_turn += 1
                                 elif ch_eff == "token":
                                     tokens_created_this_turn += ch_param
+                                    _track_token_type(ch_param, bc.name)
                                 elif ch_eff == "ramp":
                                     land_idx = next((j for j, lc in enumerate(lib) if lc.category == "Land"), None)
                                     if land_idx is not None:
@@ -4995,14 +6836,23 @@ class SimEngine:
 
                 # ---- REPEATING DRAW from permanents already on battlefield ----
                 for perm in battlefield:
-                    draws_n, repeating, _lbl, _lc = draw_cache.get(perm.name, (0, False, "", 0))
+                    draws_n, repeating, _lbl, draw_lc = draw_cache.get(perm.name, (0, False, "", 0))
                     if repeating and draws_n > 0:
                         if perm not in cards_to_cast:
+                            # Skip combat-damage draw cards — handled per-creature in trigger_cache
+                            if perm.name in trigger_cache:
+                                has_combat_draw = any(ev == "damage_dealt" and act == "draw"
+                                    for ev, cond, act, param in trigger_cache[perm.name])
+                                if has_combat_draw:
+                                    continue
                             for _ in range(int(draws_n)):
                                 if lib:
                                     hand.append(lib.pop(0))
                                     turn_bonus += 1
                                     draws_this_turn += 1
+                            # Track life costs from repeating draw engines
+                            if draw_lc > 0:
+                                sim_life_spent += draw_lc * int(draws_n)
 
                 # ---- REPEATING TOKEN GENERATORS (upkeep/trigger) ----
                 for bc in battlefield:
@@ -5013,6 +6863,7 @@ class SimEngine:
                             # use the X value from when it was cast (or estimate 3)
                             actual_tok = tok_n if tok_n != -1 else x_values_this_turn.get(bc.name, 3)
                             tokens_created_this_turn += actual_tok
+                            _track_token_type(actual_tok, bc.name)
 
                 # ---- COMBAT & ATTACK TRIGGER TOKENS ----
                 if t >= 3:
@@ -5026,12 +6877,15 @@ class SimEngine:
                                 counter_bonus = sim_total_counters // max(n_creatures, 1) if n_creatures > 0 else 0
                                 effective_pw = base_pw + anthem_buff + counter_bonus
                                 tokens_created_this_turn += effective_pw
+                                _track_token_type(effective_pw, bc.name)
                             elif ctype == "damage_fixed":
                                 actual_ct = ccount if ccount != -1 else x_values_this_turn.get(bc.name, 3)
                                 tokens_created_this_turn += actual_ct
+                                _track_token_type(actual_ct, bc.name)
                             elif ctype == "attack":
                                 actual_ct = ccount if ccount != -1 else x_values_this_turn.get(bc.name, 3)
                                 tokens_created_this_turn += actual_ct
+                                _track_token_type(actual_ct, bc.name)
 
                 # ---- TOKEN TYPE REPLACERS ----
                 # Academy Manufactor: each Clue/Food/Treasure becomes all 3 (×3)
@@ -5046,9 +6900,101 @@ class SimEngine:
                 # ---- TOKEN DOUBLERS ----
                 n_doublers = sum(1 for bc in battlefield if bc.name in token_doubler_cards)
                 if n_doublers > 0 and tokens_created_this_turn > 0:
-                    tokens_created_this_turn *= (2 ** n_doublers)
+                    mult = 2 ** n_doublers
+                    tokens_created_this_turn *= mult
+                    # Apply doubler to type counts too
+                    for tk in token_type_this_turn:
+                        token_type_this_turn[tk] *= mult
 
                 sim_total_tokens += tokens_created_this_turn
+
+                # ---- UTILITY TOKEN GENERATION & SACRIFICE ----
+                # Cards that create Clue/Food/Blood tokens → sacrifice for value
+                if utility_token_cache:
+                    clues_this_turn = 0; food_this_turn = 0; blood_this_turn = 0
+                    for bc in battlefield:
+                        if bc.name in utility_token_cache and bc not in cards_to_cast:
+                            tok_type, tok_trig = utility_token_cache[bc.name]
+                            if tok_trig == "upkeep" or tok_trig == "cast":
+                                if tok_type == "clue":
+                                    clues_this_turn += 1
+                                elif tok_type == "food":
+                                    food_this_turn += 1
+                                elif tok_type == "blood":
+                                    blood_this_turn += 1
+                    # Also count ETB tokens from cards cast this turn
+                    for cc in cards_to_cast:
+                        if cc.name in utility_token_cache:
+                            tok_type, tok_trig = utility_token_cache[cc.name]
+                            if tok_trig == "etb":
+                                if tok_type == "clue":
+                                    clues_this_turn += 1
+                                elif tok_type == "food":
+                                    food_this_turn += 1
+                                elif tok_type == "blood":
+                                    blood_this_turn += 1
+                    # Track utility token types in breakdown
+                    if clues_this_turn > 0:
+                        token_type_this_turn["Clue"] = token_type_this_turn.get("Clue", 0) + clues_this_turn
+                    if food_this_turn > 0:
+                        token_type_this_turn["Food"] = token_type_this_turn.get("Food", 0) + food_this_turn
+                    if blood_this_turn > 0:
+                        token_type_this_turn["Blood"] = token_type_this_turn.get("Blood", 0) + blood_this_turn
+
+                # Accumulate token types into per-sim totals (AFTER utility tokens)
+                for tk, cnt in token_type_this_turn.items():
+                    sim_token_types[tk] = sim_token_types.get(tk, 0) + cnt
+
+                # ---- UTILITY TOKEN SACRIFICE ----
+                if utility_token_cache:
+                    # Calculate activated ability cost reduction from permanents
+                    act_cost_red = 0
+                    act_floor_token = 1  # most reducers can't go below 1
+                    for bc in battlefield:
+                        if bc.name in activated_cost_reduction_cache:
+                            amt, tgt, min_cost = activated_cost_reduction_cache[bc.name]
+                            if tgt in ("any", "artifact"):  # Clue/Food/Blood are artifacts
+                                act_cost_red += amt
+                                if min_cost == 0:
+                                    act_floor_token = 0
+                    # Sacrifice clues: draw a card each (base cost {2}, reduced but floored)
+                    clue_sac_cost = max(2 - act_cost_red, act_floor_token)
+                    if clue_sac_cost == 0:
+                        # Free clue draws — crack all of them
+                        for _ in range(clues_this_turn):
+                            if lib:
+                                hand.append(lib.pop(0))
+                                draws_this_turn += 1
+                                turn_bonus += 1
+                    else:
+                        for _ in range(min(clues_this_turn, max(int(mana - spent), 0) // clue_sac_cost)):
+                            if lib:
+                                hand.append(lib.pop(0))
+                                draws_this_turn += 1
+                                turn_bonus += 1
+                                spent += clue_sac_cost
+                    # Food: gain 3 life each (base cost {2}, same reduction)
+                    food_sac_cost = max(2 - act_cost_red, act_floor_token)
+                    if food_sac_cost == 0:
+                        chain_lifegain += food_this_turn * 3
+                    else:
+                        for _ in range(min(food_this_turn, max(int(mana - spent), 0) // food_sac_cost)):
+                            chain_lifegain += 3
+                            spent += food_sac_cost
+                    # Blood: rummage (base cost {1}, reduced)
+                    blood_sac_cost = max(1 - act_cost_red, act_floor_token)
+                    if blood_sac_cost == 0 and blood_this_turn > 0:
+                        # Free rummage: discard worst, draw
+                        for _ in range(blood_this_turn):
+                            if hand and lib:
+                                graveyard.append(hand.pop(-1))  # discard worst (last)
+                                hand.append(lib.pop(0))
+                    elif blood_this_turn > 0:
+                        for _ in range(min(blood_this_turn, max(int(mana - spent), 0) // blood_sac_cost)):
+                            if hand and lib:
+                                graveyard.append(hand.pop(-1))
+                                hand.append(lib.pop(0))
+                                spent += blood_sac_cost
 
                 # ---- DRAIN / PING DAMAGE ----
                 drain_dmg_this_turn = chain_damage  # start with damage from trigger chains
@@ -5165,7 +7111,19 @@ class SimEngine:
                 dork_mana = sum(mana_dork_cache[bc.name] for bc in battlefield
                                 if bc.name in mana_dork_cache and bc not in cards_to_cast)
                 firebending_mana = sum(firebending_cache.get(bc.name, 0) for bc in battlefield)
-                avail_mana[t] += land_ct + ramp_mana_total + dork_mana + board_bonus_mana + firebending_mana + sim_treasures
+                base_stat_mana = land_ct + ramp_mana_total + dork_mana + board_bonus_mana + firebending_mana
+                if mana_multiplier_cache:
+                    for bc in battlefield:
+                        if bc.name in mana_multiplier_cache:
+                            mult = mana_multiplier_cache[bc.name]
+                            if mult == 3:
+                                base_stat_mana *= 3
+                            elif mult == 2:
+                                base_stat_mana *= 2
+                            elif mult == "add_1":
+                                base_stat_mana += land_ct
+                            break
+                avail_mana[t] += base_stat_mana + sim_treasures - taplands_played_this_turn
                 hand_size[t] += len(hand)
 
                 # Battlefield composition
@@ -5176,23 +7134,232 @@ class SimEngine:
                 # ---- +1/+1 COUNTER ACCUMULATION ----
                 counters_added_this_turn = chain_counters  # from trigger chains
                 n_counter_doublers = sum(1 for bc in battlefield if bc.name in counter_doubler_cards)
+
+                # Count creatures on BF for scope="each" calculations
+                n_bf_creatures_ctr = sum(1 for bc in battlefield
+                    if "creature" in (bc.type_line or "").lower()) + int(sim_total_tokens)
+
                 for bc in battlefield:
-                    if bc.name in counter_cache and bc not in cards_to_cast:
-                        ctrig, cn_per = counter_cache[bc.name]
-                        if ctrig == "etb_creature":
-                            # Triggers for each creature that entered this turn
-                            counters_added_this_turn += cn_per * creatures_entered_this_turn
-                        elif ctrig == "upkeep":
-                            # Self-growing: adds counters to itself each turn
-                            counters_added_this_turn += cn_per
-                        elif ctrig == "cast":
-                            # Triggers per spell cast (~cards_to_cast count)
-                            counters_added_this_turn += cn_per * max(1, len(cards_to_cast))
+                    if bc.name not in counter_cache or bc in cards_to_cast:
+                        continue
+                    ctrig, cn_per, scope = counter_cache[bc.name]
+                    n_ctr = cn_per if cn_per > 0 else 1  # resolve variable as 1 default
+
+                    # Resolve variable counter counts
+                    if cn_per == -1:
+                        # Variable: depends on context (power, life gained, etc.)
+                        if ctrig == "lifegain":
+                            n_ctr = max(int(chain_lifegain), 1) if chain_lifegain > 0 else 0
+                        elif ctrig == "death":
+                            n_ctr = 3  # estimate avg creature power
+                        elif ctrig == "etb_creature":
+                            # Master Biomancer: counters = its power
+                            n_ctr = power_cache.get(bc.name, 2)
+                        else:
+                            n_ctr = 2
+                    elif cn_per == -2:
+                        # Double sentinel: handled per-trigger below
+                        pass
+
+                    # Scope multiplier: how many creatures receive counters
+                    scope_mult = 1
+                    if scope == "each":
+                        scope_mult = max(n_bf_creatures_ctr, 1)
+                    elif scope == "all_attackers":
+                        scope_mult = max(n_bf_creatures_ctr, 1) if t >= 3 else 0
+
+                    if ctrig == "etb_creature":
+                        if creatures_entered_this_turn > 0:
+                            counters_added_this_turn += n_ctr * creatures_entered_this_turn * scope_mult
+                    elif ctrig == "upkeep":
+                        if cn_per == -2:
+                            # Double counters on self (Hydra's Growth)
+                            # Estimate: current counters on this creature doubles
+                            est_counters_on = max(sim_total_counters // max(n_bf_creatures_ctr, 1), 1)
+                            counters_added_this_turn += est_counters_on
+                        else:
+                            counters_added_this_turn += n_ctr * scope_mult
+                    elif ctrig == "cast":
+                        counters_added_this_turn += n_ctr * max(1, len(cards_to_cast))
+                    elif ctrig == "draw":
+                        # +1/+1 counter per card drawn (Chasm Skulker, Lorescale Coatl)
+                        counters_added_this_turn += n_ctr * draws_this_turn
+                    elif ctrig == "draw_second":
+                        # Only triggers if 2+ cards drawn this turn (Faerie Vandal)
+                        if draws_this_turn >= 2:
+                            counters_added_this_turn += n_ctr
+                    elif ctrig == "lifegain":
+                        if chain_lifegain > 0:
+                            counters_added_this_turn += n_ctr * scope_mult
+                    elif ctrig == "combat_damage" and t >= 3:
+                        counters_added_this_turn += n_ctr * scope_mult
+                    elif ctrig == "attack" and t >= 3:
+                        if cn_per == -2:
+                            # Kalonian Hydra: double all +1/+1 counters on all creatures
+                            counters_added_this_turn += sim_total_counters  # doubles existing
+                        else:
+                            counters_added_this_turn += n_ctr * scope_mult
+                    elif ctrig == "death":
+                        if creatures_died_this_turn > 0:
+                            counters_added_this_turn += n_ctr * creatures_died_this_turn * scope_mult
+                    elif ctrig == "landfall":
+                        counters_added_this_turn += n_ctr * lands_entered_this_turn
+                    elif ctrig == "counter_placed":
+                        # Fires when other counters are placed — recursive, cap at 1x
+                        if counters_added_this_turn > 0:
+                            counters_added_this_turn += n_ctr
+                    elif ctrig == "activated":
+                        # Spend leftover mana on counter placement (mana sink)
+                        remaining_act = max(int(mana - spent), 0)
+                        # Parse activation cost from oracle
+                        act_cost_m = re.search(r'\{(\d+)\}', (bc.oracle_text or ""))
+                        act_cost = int(act_cost_m.group(1)) if act_cost_m else 4
+                        act_cost = max(act_cost, 1)
+                        n_activations = min(remaining_act // act_cost, 3)  # cap at 3/turn
+                        counters_added_this_turn += n_ctr * n_activations * scope_mult
+
                 # Counter doublers (Hardened Scales = +1 per counter event, Doubling Season = x2)
                 if n_counter_doublers > 0 and counters_added_this_turn > 0:
-                    # Conservative: each doubler adds ~50% more counters
                     counters_added_this_turn = int(counters_added_this_turn * (1.5 ** n_counter_doublers))
                 sim_total_counters += counters_added_this_turn
+
+                # ---- COUNTER PAYOFF RESOLUTION ----
+                if counter_payoff_cache and counters_added_this_turn > 0:
+                    for bc in battlefield:
+                        if bc.name not in counter_payoff_cache or bc in cards_to_cast:
+                            continue
+                        ptype, pparam = counter_payoff_cache[bc.name]
+                        if ptype == "draw_per_placed":
+                            # Fathom Mage: draw per counter placed on it
+                            # Estimate this creature gets ~1/N of total counters
+                            est_on_self = max(counters_added_this_turn // max(n_bf_creatures_ctr, 1), 1)
+                            for _ in range(min(est_on_self, 10)):
+                                if lib:
+                                    hand.append(lib.pop(0))
+                                    draws_this_turn += 1
+                                    turn_bonus += 1
+                        elif ptype == "draw_combat_with_counter" and t >= 3:
+                            # Bred for the Hunt: draw per creature with counter dealing damage
+                            n_with_counters = min(n_bf_creatures_ctr, max(sim_total_counters, 0))
+                            for _ in range(min(n_with_counters, 10)):
+                                if lib:
+                                    hand.append(lib.pop(0))
+                                    draws_this_turn += 1
+                                    turn_bonus += 1
+
+                # ---- -1/-1 COUNTER RESOLUTION ----
+                # In goldfish, -1/-1 counters go on a virtual opponent's creatures.
+                # What matters for US is the payoffs: tokens created, cards drawn.
+                if neg_counter_sources or neg_counter_engines:
+                    neg_counters_placed = 0  # total -1/-1 placed this turn
+
+                    # Step 1: Count -1/-1 counters placed by sources on BF
+                    for bc in battlefield:
+                        if bc.name in neg_counter_engines and bc not in cards_to_cast:
+                            # Yawgmoth-style: sacrifice a creature, put -1/-1, draw a card
+                            # In goldfish, we sacrifice tokens if available
+                            eng_info = neg_counter_engines[bc.name][1]
+                            # Estimate: can sacrifice min(tokens, remaining_life/1) times
+                            avail_sac = max(int(sim_total_tokens), 0)
+                            if eng_info.get("life_cost"):
+                                avail_sac = min(avail_sac, max(sim_life - 5, 0))  # keep 5 life buffer
+                            n_activations = min(avail_sac, 5)  # cap at 5 per turn
+                            neg_counters_placed += n_activations
+                            if eng_info.get("draw") and n_activations > 0:
+                                for _ in range(n_activations):
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                        draws_this_turn += 1
+                                        turn_bonus += 1
+                            # Track life spent from engine activations
+                            if eng_info.get("life_cost") and n_activations > 0:
+                                sim_life_spent += n_activations  # 1 life per activation
+                            # Tokens sacrificed reduce token count (recovered from payoffs below)
+                            sim_total_tokens = max(sim_total_tokens - n_activations, 0)
+
+                        elif bc.name in neg_counter_sources and bc not in cards_to_cast:
+                            ntrig, n_neg, nscope = neg_counter_sources[bc.name]
+                            n_neg_resolved = max(n_neg, 1) if n_neg > 0 else 3  # variable default
+                            scope_n = 1
+                            if nscope == "each_all":
+                                scope_n = 4  # estimate ~4 opponent creatures
+                            elif nscope == "each_opponent":
+                                scope_n = 3
+
+                            if ntrig == "activated":
+                                # Spend leftover mana
+                                remaining_act = max(int(mana - spent), 0)
+                                act_cost_m = re.search(r'\{(\d+)\}', (bc.oracle_text or ""))
+                                act_cost = int(act_cost_m.group(1)) if act_cost_m else 3
+                                act_cost = max(act_cost, 1)
+                                n_act = min(remaining_act // act_cost, 3)
+                                neg_counters_placed += n_neg_resolved * n_act * scope_n
+                            elif ntrig == "upkeep":
+                                neg_counters_placed += n_neg_resolved * scope_n
+                            elif ntrig == "etb":
+                                neg_counters_placed += n_neg_resolved  # one-shot on entry
+                            elif ntrig == "attack" and t >= 3:
+                                neg_counters_placed += n_neg_resolved
+                            elif ntrig == "combat" and t >= 3:
+                                neg_counters_placed += n_neg_resolved
+
+                    # Also count -1/-1 from spells cast this turn
+                    for cc_card in cards_to_cast:
+                        if cc_card.name in neg_counter_sources:
+                            ntrig, n_neg, nscope = neg_counter_sources[cc_card.name]
+                            if ntrig == "cast":
+                                scope_n = 4 if nscope == "each_all" else 1
+                                n_neg_resolved = max(n_neg, 1) if n_neg > 0 else 3
+                                if n_neg == -1:
+                                    # X-cost: spend available mana
+                                    n_neg_resolved = max(int(mana - spent) // 2, 2)
+                                neg_counters_placed += n_neg_resolved * scope_n
+
+                    # Step 2: Resolve -1/-1 payoffs
+                    if neg_counters_placed > 0 and neg_counter_payoffs:
+                        for bc in battlefield:
+                            if bc.name not in neg_counter_payoffs or bc in cards_to_cast:
+                                continue
+                            ptype, pparam = neg_counter_payoffs[bc.name]
+                            if ptype == "token_per_counter":
+                                # Hapatra: 1 token per placement event
+                                # Nest of Scarabs: N tokens per N counters ("that many")
+                                if pparam == -1:
+                                    tokens_made = neg_counters_placed  # 1:1
+                                else:
+                                    tokens_made = max(pparam, 1) * neg_counters_placed
+                                # Cap token generation reasonably
+                                tokens_made = min(tokens_made, 20)
+                                sim_total_tokens += tokens_made
+                                creatures_entered_this_turn += tokens_made
+                            elif ptype == "draw_on_neg_death":
+                                # Scorpion God: draw when creature with -1/-1 dies
+                                # In goldfish, estimate ~40% of opponent creatures die from -1/-1
+                                est_deaths = max(int(neg_counters_placed * 0.4), 1)
+                                for _ in range(min(est_deaths, 5)):
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                        draws_this_turn += 1
+                                        turn_bonus += 1
+                            elif ptype == "chain_neg":
+                                # Blowfly Infestation: chain -1/-1 on death
+                                # Creates more deaths which creates more tokens
+                                chain_extra = max(int(neg_counters_placed * 0.3), 1)
+                                neg_counters_placed += chain_extra
+                                # Re-trigger token payoffs for chain
+                                for bc2 in battlefield:
+                                    if bc2.name in neg_counter_payoffs and bc2.name != bc.name:
+                                        p2, pp2 = neg_counter_payoffs[bc2.name]
+                                        if p2 == "token_per_counter":
+                                            extra_tok = min(chain_extra, 10)
+                                            sim_total_tokens += extra_tok
+                                            creatures_entered_this_turn += extra_tok
+                            elif ptype == "draw_per_neg":
+                                for _ in range(min(neg_counters_placed, 8)):
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                        draws_this_turn += 1
+                                        turn_bonus += 1
 
                 # Check if any haste granter is on the battlefield
                 has_haste_granter = False
@@ -5234,6 +7401,14 @@ class SimEngine:
                     total_power += (sim_total_tokens - tokens_created_this_turn) * (1 + anthem_buff)
                     # +1/+1 counters spread across creatures add to total power
                     total_power += sim_total_counters
+                    # Prowess/Magecraft: +N/+N per noncreature spell cast this turn
+                    if prowess_cache:
+                        noncreature_spells = sum(1 for c in cards_to_cast
+                            if "creature" not in (c.type_line or "").lower()
+                            and c.category != "Land")
+                        for bc in battlefield:
+                            if bc.name in prowess_cache and bc not in cards_to_cast:
+                                total_power += prowess_cache[bc.name] * noncreature_spells
                     # Equipment power bonus (attached to best creature)
                     if equip_cache and n_creatures > 0:
                         for bc in battlefield:
@@ -5281,6 +7456,11 @@ class SimEngine:
                 bf_enchantments[t] += n_enchantments
                 bf_total[t] += n_nonland
                 token_count[t] += sim_total_tokens  # cumulative tokens on board
+                # Accumulate token type breakdown per turn
+                for tk, cnt in sim_token_types.items():
+                    if tk not in token_type_totals[t]:
+                        token_type_totals[t][tk] = 0
+                    token_type_totals[t][tk] += cnt
                 combat_power[t] += total_power
 
                 # Cumulative damage: combat (from T3) + drain/ping
@@ -5300,6 +7480,15 @@ class SimEngine:
                 if t >= 3:
                     combat_trigger_q = []
                     n_attackers = n_creatures + max(int(sim_total_tokens - tokens_created_this_turn), 0)
+                    # Myriad: each myriad creature creates 2 token copies attacking
+                    # other opponents. Extra tokens count as attackers for triggers.
+                    myriad_bonus_power = 0
+                    if myriad_cache:
+                        for bc in battlefield:
+                            if bc.name in myriad_cache and bc not in cards_to_cast:
+                                n_attackers += 2  # 2 token copies
+                                myriad_bonus_power += power_cache.get(bc.name, 1) * 2
+                        combat_dmg += myriad_bonus_power
                     for bp in battlefield:
                         if bp.name in trigger_cache and bp not in cards_to_cast:
                             for ev, cond, act, param in trigger_cache[bp.name]:
@@ -5313,6 +7502,40 @@ class SimEngine:
                                         combat_trigger_q.append((act, param, bp.name))
                     if combat_trigger_q:
                         resolve_queue(combat_trigger_q)
+
+                    # ---- MENTOR / TRAINING COUNTERS ----
+                    # Each mentor/training creature adds 1 counter per attack
+                    if mentor_training_cache:
+                        for bc in battlefield:
+                            if bc.name in mentor_training_cache and bc not in cards_to_cast:
+                                sim_total_counters += 1
+
+                    # ---- CONNIVE ON ATTACK ----
+                    # Connive N: draw N, discard N (net 0 cards), +1/+1 counter per nonland discarded
+                    # ~60% of discards are nonland → ~0.6 counters per connive
+                    if connive_cache:
+                        for bc in battlefield:
+                            if bc.name in connive_cache and bc not in cards_to_cast:
+                                cn = connive_cache[bc.name]
+                                if cn == -1:
+                                    # Variable: X = number of attackers (Raffine)
+                                    cn = n_attackers
+                                # Draw cn, discard cn (net 0 cards but filter quality)
+                                for _ in range(min(cn, 5)):  # cap at 5 to avoid edge cases
+                                    if lib:
+                                        hand.append(lib.pop(0))
+                                if len(hand) >= cn:
+                                    # Discard worst cn cards (in goldfish, lands if flooding)
+                                    discardable = sorted(hand, key=lambda c: (
+                                        0 if c.category == "Land" and lands_played_this_turn >= max_lands else 2,
+                                        -int(c.cmc)
+                                    ))
+                                    for dc in discardable[:cn]:
+                                        hand.remove(dc)
+                                        graveyard.append(dc)
+                                        # +1/+1 counter for each nonland discarded
+                                        if dc.category != "Land":
+                                            sim_total_counters += 1
 
                 # ---- TREASURE FROM COMBAT DAMAGE ----
                 if t >= 3:
@@ -5362,6 +7585,7 @@ class SimEngine:
                 total_dmg_this_turn = combat_dmg + drain_dmg_this_turn
                 sim_cumul_dmg += total_dmg_this_turn
                 cumul_damage[t] += sim_cumul_dmg
+                opp_mill_total[t] += sim_opp_milled
 
                 # ---- EXTRA TURNS ----
                 # Each bonus turn: draw, play land, another combat with same board
@@ -5411,7 +7635,7 @@ class SimEngine:
                 bf_names = {bc.name for bc in battlefield}
                 # Accumulate lifegain across turns
                 sim_cumul_lifegain += chain_lifegain
-                sim_life = 40 + sim_cumul_lifegain  # simplified: start at 40, add all gains (ignore life costs for now)
+                sim_life = 40 + sim_cumul_lifegain - sim_life_spent
 
                 # Track commander combat damage (21 from one commander = win)
                 if t >= 3:
@@ -5471,6 +7695,49 @@ class SimEngine:
                 if infect_dmg_this_turn > 0:
                     sim_cmdr_cumul_dmg["__infect__"] = sim_cmdr_cumul_dmg.get("__infect__", 0) + infect_dmg_this_turn
 
+                # ---- PER-SIM KILL TURN CHECK ----
+                # First opponent dies at 40 regular damage OR 21 commander damage (whichever first)
+                if sim_kill_turn_1opp is None:
+                    if sim_cumul_dmg >= 40:
+                        sim_kill_turn_1opp = t
+                    else:
+                        # Check if any single commander dealt 21+
+                        for cm_name, cm_dmg in sim_cmdr_cumul_dmg.items():
+                            if cm_name.startswith("__"): continue
+                            if cm_dmg >= 21:
+                                sim_kill_turn_1opp = t
+                                break
+                        # Also check infect 10
+                        if sim_kill_turn_1opp is None:
+                            sim_cumul_infect = sim_cmdr_cumul_dmg.get("__infect__", 0)
+                            if sim_cumul_infect >= 10:
+                                sim_kill_turn_1opp = t
+                # 3 opponents: need 120 regular damage total (commander damage only kills 1)
+                # Or 40 regular + 21 cmdr (kill 1 with cmdr, 2 with regular = 80 regular)
+                # Simplified: if cmdr dealt 21, remaining 2 opponents need 80 total
+                if sim_kill_turn_3opp is None:
+                    if sim_cumul_dmg >= 120:
+                        sim_kill_turn_3opp = t
+                    elif sim_cumul_dmg >= 80:
+                        # Check if commander already killed one opponent
+                        for cm_name, cm_dmg in sim_cmdr_cumul_dmg.items():
+                            if cm_name.startswith("__"): continue
+                            if cm_dmg >= 21:
+                                sim_kill_turn_3opp = t
+                                break
+
+                # ---- MILL KILL CHECK ----
+                # Commander library = 99 cards. Mill 99 = deck 1 opponent out.
+                if sim_mill_kill_1opp is None and sim_opp_milled >= 99:
+                    sim_mill_kill_1opp = t
+                    # Mill also counts as a kill for overall win timing
+                    if sim_kill_turn_1opp is None:
+                        sim_kill_turn_1opp = t
+                if sim_mill_kill_3opp is None and sim_opp_milled >= 297:
+                    sim_mill_kill_3opp = t
+                    if sim_kill_turn_3opp is None:
+                        sim_kill_turn_3opp = t
+
                 # ---- PER-TURN ALTERNATE WIN CONDITION CHECK ----
                 if sim_alt_win_turn is None and alt_win_cache:
                     hand_names = {hc.name for hc in hand}
@@ -5500,8 +7767,45 @@ class SimEngine:
 
                         elif aw_type == "life_total_exact":
                             # Near-Death Experience: exactly 1 life at upkeep
-                            # Can't meaningfully goldfish this — skip
-                            pass
+                            # In goldfish, player actively drains life with Necropotence, Bolas's Citadel,
+                            # painlands, etc. Check if life-paying cards exist and are on BF.
+                            # If we have any life-cost draw engines running, sim_life tracks costs.
+                            if on_bf and sim_life <= aw_thresh:
+                                sim_alt_win_turn = t
+                            elif on_bf and sim_life_spent > 0:
+                                # We're spending life — estimate when we hit exactly 1
+                                # If total life spent this game puts us close, model it
+                                if sim_life <= 10:
+                                    sim_alt_win_turn = t
+
+                        elif aw_type == "clone_copies":
+                            # Biovisionary: control 4+ creatures named Biovisionary
+                            # Count: 1 original + clones on BF that would copy it
+                            if on_bf:
+                                # Count how many clone cards are also on BF
+                                n_copies = 1  # the original
+                                for bp in battlefield:
+                                    if bp.name != aw_name and bp.name in clone_cards:
+                                        n_copies += 1  # clone would copy Biovisionary
+                                # Also count token copies (from Rite of Replication etc.)
+                                # Heuristic: if we have copy-token effects, add estimated copies
+                                if n_copies >= aw_thresh:
+                                    sim_alt_win_turn = t
+
+                        elif aw_type == "creature_names_combat":
+                            # Ramses Assassin Lord: 3+ creatures with different names
+                            # dealt combat damage this turn → opponent loses
+                            if on_bf and t >= 3:
+                                creature_names = set()
+                                for bp in battlefield:
+                                    if "creature" in (bp.type_line or "").lower():
+                                        creature_names.add(bp.name)
+                                # Tokens count as creatures (name = token type, usually same)
+                                # so add 1 for tokens if we have any
+                                if sim_total_tokens > 0:
+                                    creature_names.add("__token__")
+                                if len(creature_names) >= aw_thresh:
+                                    sim_alt_win_turn = t
 
                         elif aw_type == "creature_count":
                             # Epic Struggle (20+), Halo Fountain (15 tapped)
@@ -5684,6 +7988,20 @@ class SimEngine:
                 alt_win_turn_sum += sim_alt_win_turn
                 alt_win_turn_count += 1
 
+            # Accumulate kill turn results (accounting for commander damage)
+            if sim_kill_turn_1opp is not None:
+                kill_turn_1opp_sum += sim_kill_turn_1opp
+                kill_turn_1opp_count += 1
+            if sim_kill_turn_3opp is not None:
+                kill_turn_3opp_sum += sim_kill_turn_3opp
+                kill_turn_3opp_count += 1
+            if sim_mill_kill_1opp is not None:
+                mill_kill_1opp_sum += sim_mill_kill_1opp
+                mill_kill_1opp_count += 1
+            if sim_mill_kill_3opp is not None:
+                mill_kill_3opp_sum += sim_mill_kill_3opp
+                mill_kill_3opp_count += 1
+
             if pcb and i % 100 == 0: pcb(i / n)
 
         for t in td:
@@ -5698,8 +8016,12 @@ class SimEngine:
             bf_enchantments[t] /= n
             bf_total[t] /= n
             token_count[t] /= n
+            # Average token type breakdown
+            for tk in token_type_totals[t]:
+                token_type_totals[t][tk] /= n
             combat_power[t] /= n
             cumul_damage[t] /= n
+            opp_mill_total[t] /= n
             cards_drawn_this_turn[t] /= n
             gy_size[t] /= n
             removal_cast[t] /= n
@@ -5709,24 +8031,33 @@ class SimEngine:
         # Sanitize: prevent -0.0 from appearing in results (replace with +0.0)
         for d in (ld, bonus_draws, total_cards, avail_mana, hand_size, bf_creatures,
                   bf_artifacts, bf_enchantments, bf_total, token_count, combat_power,
-                  cumul_damage, cards_drawn_this_turn, gy_size, removal_cast,
+                  cumul_damage, opp_mill_total, cards_drawn_this_turn, gy_size, removal_cast,
                   removal_available, removal_drawn):
             for t in d:
                 if d[t] == 0: d[t] = 0.0  # convert int 0 or -0.0 to +0.0
         if pcb: pcb(1.0)
 
-        # Estimate "win turn": first turn avg cumulative damage >= 40 (one opponent)
-        win_turn_1opp = None
-        win_turn_3opp = None
-        for t in range(1, turns + 1):
-            if win_turn_1opp is None and cumul_damage[t] >= 40:
-                win_turn_1opp = t
-            if win_turn_3opp is None and cumul_damage[t] >= 120:
-                win_turn_3opp = t
+        # Estimate "win turn" using per-sim kill tracking (accounts for commander damage 21)
+        # Primary: averaged per-sim kill turns (includes cmdr dmg + infect shortcuts)
+        if kill_turn_1opp_count > 0:
+            win_turn_1opp = round(kill_turn_1opp_sum / kill_turn_1opp_count, 1)
+        else:
+            # Fallback to threshold on averaged data
+            win_turn_1opp = None
+            for t in range(1, turns + 1):
+                if cumul_damage[t] >= 40:
+                    win_turn_1opp = t; break
+        if kill_turn_3opp_count > 0:
+            win_turn_3opp = round(kill_turn_3opp_sum / kill_turn_3opp_count, 1)
+        else:
+            win_turn_3opp = None
+            for t in range(1, turns + 1):
+                if cumul_damage[t] >= 120:
+                    win_turn_3opp = t; break
 
         # Count draw sources in deck
         draw_sources = []
-        for c in cards:
+        for c in list(cards) + (commanders or []):
             dn, rep, lbl, _lc = draw_cache.get(c.name, (0, False, "", 0))
             if dn > 0:
                 draw_sources.append({"name": c.name, "qty": c.quantity, "draws": dn,
@@ -5760,18 +8091,397 @@ class SimEngine:
                 "avg_turn": avg_alt_turn,
             }
 
+        # Mill kill stats
+        mill_win_1opp = round(mill_kill_1opp_sum / mill_kill_1opp_count, 1) if mill_kill_1opp_count > 0 else None
+        mill_win_3opp = round(mill_kill_3opp_sum / mill_kill_3opp_count, 1) if mill_kill_3opp_count > 0 else None
+
+        # ---- CARD IMPACT RANKING ----
+        # Score each card's goldfish value from existing caches (no extra sims needed).
+        # Higher score = more valuable in goldfish. Negative = actively bad.
+        card_impacts = []
+        all_impact_cards = list(cards) + (commanders or [])
+        for c in all_impact_cards:
+            score = 0
+            tags = []
+            cmc = int(c.cmc) if c.cmc else 0
+            tl = (c.type_line or "").lower()
+
+            # Draw value
+            dn, rep, lbl, _lc = draw_cache.get(c.name, (0, False, "", 0))
+            if dn > 0:
+                if rep:
+                    score += dn * 5  # repeating draw is very valuable
+                    tags.append(f"draws ~{dn}/turn")
+                else:
+                    score += dn * 2
+                    tags.append(f"draws {dn}")
+
+            # Mana value
+            if c.category == "Ramp":
+                mana_val = mana_cache.get(c.name, 1)
+                score += mana_val * 3
+                tags.append(f"+{mana_val} mana")
+            if c.name in mana_dork_cache:
+                score += mana_dork_cache[c.name] * 2.5
+                tags.append(f"dork +{mana_dork_cache[c.name]}")
+            if c.name in ritual_cache:
+                score += ritual_cache[c.name] * 1.5
+                tags.append(f"ritual +{ritual_cache[c.name]}")
+
+            # Combat value
+            if "creature" in tl and c.category != "Ramp":
+                pw = power_cache.get(c.name, 1)
+                score += pw * 1.0
+                if pw >= 4:
+                    tags.append(f"power {pw}")
+            if c.name in prowess_cache:
+                score += 2
+                tags.append("prowess")
+
+            # Token generation
+            if c.name in token_cache:
+                tok_n, tok_rep = token_cache[c.name]
+                if tok_n > 0:
+                    if tok_rep:
+                        score += tok_n * 3
+                        tags.append(f"tokens ~{tok_n}/turn")
+                    else:
+                        score += tok_n * 1.5
+                        tags.append(f"creates {tok_n} token")
+            if c.name in etb_token_cache:
+                score += etb_token_cache[c.name] * 1.5
+            if c.name in treasure_create_cache:
+                _, tn = treasure_create_cache[c.name]
+                score += tn * 2
+                tags.append(f"treasure")
+            if c.name in spell_treasure_cache:
+                score += spell_treasure_cache[c.name] * 1.5
+
+            # Mill value
+            if c.name in opp_mill_cache:
+                mn, mt = opp_mill_cache[c.name]
+                mill_val = mn if mn > 0 else 5
+                if mt in ("upkeep", "draw", "opponent_cast", "opponent_untap", "combat_per_creature", "combat_per_damage"):
+                    score += mill_val * 1.5  # repeating mill
+                    tags.append(f"mills ~{mill_val}/turn")
+                else:
+                    score += mill_val * 0.5
+                    tags.append(f"mills {mill_val}")
+            if c.name in mill_doubler_cards:
+                score += 8
+                tags.append("mill doubler")
+
+            # Anthem/counter value
+            if c.name in anthem_cache:
+                score += anthem_cache[c.name] * 3
+                tags.append(f"anthem +{anthem_cache[c.name]}")
+            if c.name in counter_cache:
+                ctrig, cn_per, scope = counter_cache[c.name]
+                # Score based on how many counters this generates per turn
+                scope_mult = 3 if scope == "each" else 1.5 if scope == "all_attackers" else 1
+                if ctrig in ("draw", "draw_second"):
+                    score += 4 * scope_mult  # draw-triggered = fires many times per turn in draw decks
+                    tags.append(f"+1/+1 per draw ({scope})")
+                elif ctrig == "lifegain":
+                    score += 3 * scope_mult
+                    tags.append(f"+1/+1 on lifegain ({scope})")
+                elif ctrig == "combat_damage":
+                    score += 3 * scope_mult
+                    tags.append(f"+1/+1 on combat damage ({scope})")
+                elif ctrig == "attack" and cn_per == -2:
+                    score += 6  # doubling all counters is massive
+                    tags.append("doubles all +1/+1 counters on attack")
+                elif ctrig == "etb_creature":
+                    score += 2 * scope_mult
+                    tags.append(f"+1/+1 per creature ETB ({scope})")
+                elif ctrig == "death":
+                    score += 2 * scope_mult
+                    tags.append(f"+1/+1 on death ({scope})")
+                elif ctrig == "landfall":
+                    score += 2
+                    tags.append("+1/+1 on landfall")
+                elif ctrig == "upkeep":
+                    if cn_per == -2:
+                        score += 4
+                        tags.append("doubles own counters each turn")
+                    else:
+                        score += 2
+                        tags.append("+1/+1 counters (repeating)")
+                elif ctrig == "cast":
+                    score += 2
+                    tags.append("+1/+1 per spell cast")
+                elif ctrig == "activated":
+                    score += 1.5
+                    tags.append("+1/+1 (activated)")
+                else:
+                    score += 2
+                    tags.append("+1/+1 counters")
+            if c.name in counter_payoff_cache:
+                ptype, pparam = counter_payoff_cache[c.name]
+                if ptype == "draw_per_placed":
+                    score += 5
+                    tags.append("draws per counter placed")
+                elif ptype == "draw_per_counter_creature":
+                    score += 3
+                    tags.append("draws per creature with counter")
+                elif ptype == "draw_combat_with_counter":
+                    score += 3
+                    tags.append("draws on counter-creature combat")
+                elif ptype == "cost_reduction":
+                    score += 4
+                    tags.append("cost reduction per counter")
+                elif ptype == "keyword_grant":
+                    score += 2
+                    tags.append(f"grants {pparam} to counter-creatures")
+                elif ptype == "growth_tracking":
+                    score += 3
+                    tags.append("tracks counters for alt-win")
+                elif ptype == "token_per_counter_placed":
+                    score += 4
+                    tags.append("token per counter placed")
+                elif ptype == "mana_from_counters":
+                    score += 3
+                    tags.append("mana from counter-creatures")
+                elif ptype == "untap_with_counters":
+                    score += 2
+                    tags.append("untaps counter-creatures")
+            if c.name in counter_doubler_cards:
+                score += 6
+                tags.append("counter doubler")
+            if c.name in mentor_training_cache:
+                if "+1/+1" not in str(tags):
+                    score += 2
+                    tags.append("+1/+1 per attack (mentor/training)")
+
+            # -1/-1 counter scoring
+            if c.name in neg_counter_engines:
+                eng_info = neg_counter_engines[c.name][1]
+                score += 8 if eng_info.get("draw") else 5
+                tags.append("-1/-1 engine (sac+counter" + ("+draw)" if eng_info.get("draw") else ")"))
+            elif c.name in neg_counter_payoffs:
+                ptype, pparam = neg_counter_payoffs[c.name]
+                if ptype == "token_per_counter":
+                    score += 6 if pparam == -1 else 4  # Nest of Scarabs (N:N) > Hapatra (1:1)
+                    tags.append("-1/-1 → tokens")
+                elif ptype == "draw_on_neg_death":
+                    score += 5
+                    tags.append("-1/-1 death → draw")
+                elif ptype == "chain_neg":
+                    score += 4
+                    tags.append("-1/-1 chain reaction")
+                elif ptype == "draw_per_neg":
+                    score += 5
+                    tags.append("-1/-1 → draw")
+                elif ptype == "drain_per_neg":
+                    score += 3
+                    tags.append("-1/-1 → drain")
+            elif c.name in neg_counter_sources:
+                ntrig, n_neg, nscope = neg_counter_sources[c.name]
+                scope_bonus = 2 if "each" in nscope else 0
+                if ntrig == "upkeep":
+                    score += 3 + scope_bonus
+                    tags.append(f"-1/-1 repeating ({nscope})")
+                elif ntrig == "activated":
+                    score += 3 + scope_bonus
+                    tags.append(f"-1/-1 activated ({nscope})")
+                elif ntrig == "combat":
+                    score += 2
+                    tags.append("-1/-1 via wither/infect")
+                else:
+                    score += 2
+                    tags.append(f"-1/-1 source ({ntrig})")
+
+            # Persistent topdeck manipulation (scry every turn)
+            if c.name in persistent_scry_cache:
+                n_look = persistent_scry_cache[c.name]
+                score += 2 + n_look * 0.5  # scry 3 = +3.5, scry 1 = +2.5
+                tags.append(f"topdeck manipulation (scry {n_look}/turn)")
+
+            # Kindred doublers / spell copiers / trigger doublers
+            oracle_ci = (c.oracle_text or "").lower()
+            tl_ci = (c.type_line or "").lower()
+            if "instant" not in tl_ci and "sorcery" not in tl_ci:
+                is_kindred_scoped = (
+                    re.search(r'choose\s+a\s+creature\s+type', oracle_ci) or
+                    re.search(r'outlaw|chosen\s+type', oracle_ci)
+                )
+                # Spell copiers: "copy that spell" (Double Down, Reflections of Littjara)
+                if re.search(r'copy\s+that\s+spell', oracle_ci):
+                    if kindred_type and is_kindred_scoped:
+                        # In kindred deck: doubles every typed creature → ~1 extra token per creature cast
+                        score += kindred_count * 0.8
+                        tags.append(f"copies {kindred_type} spells")
+                    else:
+                        score += 4
+                        tags.append("spell copier")
+                # Token copiers: "create a token that's a copy" (Molten Echoes, Kindred Charge)
+                elif re.search(r'(?:create|put).*?token.*?copy\s+of\s+(?:that|each)\s+creature', oracle_ci):
+                    if kindred_type and is_kindred_scoped:
+                        score += kindred_count * 0.6
+                        tags.append(f"copies {kindred_type} tokens")
+                    else:
+                        score += 3
+                        tags.append("token copier")
+                # Trigger doublers: "triggers an additional time" (Roaming Throne, Panharmonicon)
+                elif re.search(r'triggers?\s+(?:an?\s+)?additional\s+time', oracle_ci):
+                    if kindred_type and is_kindred_scoped:
+                        score += 8  # doubles all kindred triggers (draw, mill, counters, etc.)
+                        tags.append(f"doubles {kindred_type} triggers")
+                    else:
+                        score += 5  # doubles ETB triggers generally
+                        tags.append("trigger doubler")
+
+            # ---- COMPREHENSIVE KINDRED SCORING ----
+            # Catch kindred-relevant patterns not covered by other caches.
+            if not oracle_ci:
+                oracle_ci = (c.oracle_text or "").lower()
+            if kindred_type:
+                # Cost reduction: "cost {1}/{2} less to cast"
+                m_cost_red = re.search(r'cost\s+\{(\d)\}\s+less\s+to\s+cast', oracle_ci)
+                if m_cost_red and ("chosen type" in oracle_ci or kindred_type in oracle_ci
+                        or "outlaw" in oracle_ci or "creature spells" in oracle_ci):
+                    red = int(m_cost_red.group(1))
+                    if f"cost_red" not in str(tags):
+                        score += red * 3  # saving mana every creature cast
+                        tags.append(f"reduces cost by {red}")
+
+                # Type enablers: "creatures you control are [every/the chosen] creature type"
+                if re.search(r'creatures\s+you\s+control\s+are\s+(?:every\s+creature\s+type|the\s+chosen\s+(?:creature\s+)?type)', oracle_ci):
+                    score += 5  # enables all kindred synergies for non-typed creatures
+                    tags.append("type enabler")
+
+                # ETB +1/+1 counters on typed creatures: "enters with an additional +1/+1 counter"
+                if re.search(r'enters\s+the\s+battlefield\s+with\s+(?:an?\s+)?additional\s+\+1/\+1\s+counter', oracle_ci):
+                    score += 4  # every creature enters bigger
+                    tags.append("+1/+1 on each creature ETB")
+
+                # Per-creature combat buff: "[type] deals combat damage...gets +N/+N"
+                m_combat_buff = re.search(r'deals\s+combat\s+damage.*?gets?\s+\+(\d+)/\+(\d+)', oracle_ci)
+                if m_combat_buff:
+                    buff = int(m_combat_buff.group(1))
+                    if f"+{buff}" not in str(tags):
+                        score += buff * 2  # applies to each connecting creature
+                        tags.append(f"+{buff}/+{m_combat_buff.group(2)} on combat damage")
+
+                # Mass creature cheat / recursion: "returns/puts creature cards to/onto the battlefield"
+                if re.search(r'(?:return|put)s?\s+.*?(?:creature\s+)?cards?\s+.*?(?:onto|to)\s+the\s+battlefield', oracle_ci):
+                    if "graveyard" in oracle_ci:
+                        # Mass recursion (Patriarch's Bidding, Living Death)
+                        score += 5
+                        tags.append("mass recursion")
+                    elif "library" in oracle_ci or "reveal" in oracle_ci:
+                        # Mass cheat from library (Kindred Summons)
+                        score += kindred_count * 0.5
+                        tags.append(f"cheats ~{kindred_count//2} creatures")
+
+                # One-sided board wipe: "destroy all creatures that aren't of the chosen type"
+                if re.search(r'destroy\s+all\s+creatures\s+that\s+aren', oracle_ci):
+                    score += 4  # one-sided wipe is premium in kindred
+                    tags.append("one-sided wipe")
+
+                # Conditional draw from top: "look at the top...put it into your hand"
+                if re.search(r'look\s+at\s+the\s+top.*?put\s+it\s+into\s+your\s+hand', oracle_ci):
+                    if "chosen type" in oracle_ci or kindred_type in oracle_ci:
+                        # ~40-50% hit rate in kindred deck
+                        if "draws" not in str(tags) and "hand_tutor" not in str(tags):
+                            score += 2.5
+                            tags.append("conditional draw (~0.5/turn)")
+
+                # Pod-style tutor: "sacrifice a creature: search your library for a creature"
+                if re.search(r'sacrifice\s+a\s+creature.*?search\s+your\s+library\s+for\s+a\s+creature', oracle_ci):
+                    score += 4
+                    tags.append("creature tutor (repeating)")
+
+                # Kindred draw on ETB/attack: "whenever a creature of the chosen type enters or attacks, draw"
+                if re.search(r'whenever\s+(?:a|another)\s+creature.*?(?:chosen\s+type|' + re.escape(kindred_type) + r').*?(?:enters|attacks).*?draw', oracle_ci):
+                    if "draws" not in str(tags):
+                        score += kindred_count * 0.3
+                        tags.append(f"draws per {kindred_type} ETB/attack")
+
+            # ETB value
+            etb_effs = etb_value_cache.get(c.name, {})
+            if etb_effs:
+                for ek, ev in etb_effs.items():
+                    if isinstance(ev, (int, float)) and ev > 0:
+                        score += ev * 1.0
+
+            # Extra turns / combats
+            if c.name in extra_turn_cards:
+                score += 5
+                tags.append("extra turn")
+            if c.name in extra_combat_cache:
+                score += 3
+                tags.append("extra combat")
+
+            # Mana multiplier
+            if c.name in mana_multiplier_cache:
+                score += 6
+                tags.append("mana doubler")
+
+            # Tutor value: finding your best card > drawing a random card
+            if c.category == "Tutor":
+                score += 5  # equivalent to ~2.5 quality draws
+                tags.append("tutor")
+            # Removal: has real-game value even though goldfish-low
+            if c.category == "Removal":
+                score += 1  # baseline credit for interaction slot
+                if not tags:
+                    tags.append("removal")
+            if c.category == "Board Wipe":
+                score += 1.5
+                if not tags:
+                    tags.append("board wipe")
+            if c.category == "Protection":
+                score += 0.5
+                if not tags:
+                    tags.append("protection")
+
+            # Cost efficiency (cheap cards score higher)
+            score -= cmc * 0.3
+
+            # Goldfish-dead penalty
+            if c.name in goldfish_dead:
+                score = -2
+                tags = ["dead in goldfish"]
+
+            # Lands: flat value based on entering untapped
+            if c.category == "Land":
+                score = 2.0 if c.name not in tapland_cards else 1.0
+                if c.name in fetch_land_cache:
+                    score = 2.5
+                    tags = ["fetch"]
+                elif c.name in tapland_cards:
+                    tags = ["enters tapped"]
+                else:
+                    tags = []
+
+            card_impacts.append({
+                "name": c.name, "qty": c.quantity, "category": c.category,
+                "score": round(score, 1), "tags": tags, "cmc": cmc,
+                "is_commander": c.is_commander if hasattr(c, 'is_commander') else False
+            })
+
+        # Sort by score descending
+        card_impacts.sort(key=lambda x: x["score"], reverse=True)
+
         return {"turn_avgs": td, "land_drops": ld, "bonus_draws": bonus_draws,
                 "total_cards": total_cards, "draw_sources": draw_sources,
-                "combo_stats": combo_stats,
+                "combo_stats": combo_stats, "card_impacts": card_impacts,
                 "avail_mana": avail_mana, "hand_size": hand_size,
                 "bf_creatures": bf_creatures, "bf_artifacts": bf_artifacts,
                 "bf_enchantments": bf_enchantments, "bf_total": bf_total,
-                "token_count": token_count, "combat_power": combat_power,
-                "cumul_damage": cumul_damage, "cards_drawn_this_turn": cards_drawn_this_turn,
+                "token_count": token_count, "token_types": token_type_totals, "combat_power": combat_power,
+                "cumul_damage": cumul_damage, "opp_mill": opp_mill_total, "cards_drawn_this_turn": cards_drawn_this_turn,
                 "gy_size": gy_size,
                 "removal_cast": removal_cast, "removal_available": removal_available,
                 "removal_drawn": removal_drawn,
                 "win_turn_1opp": win_turn_1opp, "win_turn_3opp": win_turn_3opp,
+                "kill_pct_1opp": kill_turn_1opp_count / n * 100 if n > 0 else 0,
+                "kill_pct_3opp": kill_turn_3opp_count / n * 100 if n > 0 else 0,
+                "mill_win_1opp": mill_win_1opp, "mill_win_3opp": mill_win_3opp,
+                "mill_pct_1opp": mill_kill_1opp_count / n * 100 if n > 0 else 0,
+                "mill_pct_3opp": mill_kill_3opp_count / n * 100 if n > 0 else 0,
+                "kindred_type": kindred_type, "kindred_count": kindred_count,
                 "alt_win_stats": alt_win_stats}
 
 # ============================================================================
@@ -7478,6 +10188,9 @@ class FasterFishing:
         ttk.Label(row1, text="Mull to:").pack(side=tk.LEFT, padx=(15,0))
         self.min_mull = tk.StringVar(value="4"); ttk.Entry(row1, textvariable=self.min_mull, width=5).pack(side=tk.LEFT, padx=5)
         self.gf_btn = ttk.Button(row1, text="Run Simulation", command=self._run_gf); self.gf_btn.pack(side=tk.RIGHT)
+        # Compare button placeholder (future feature)
+        # self.gf_compare_btn = ttk.Button(row1, text="Compare vs Previous", command=self._toggle_compare, state=tk.DISABLED)
+        # self.gf_compare_btn.pack(side=tk.RIGHT, padx=5)
         ttk.Button(row1, text="Play Goldfish", command=self._show_goldfish_game).pack(side=tk.RIGHT, padx=5)
         ttk.Button(row1, text="Sample Hand", command=self._show_hand).pack(side=tk.RIGHT, padx=5)
 
@@ -8453,8 +11166,10 @@ class FasterFishing:
         bfc = r["bf_creatures"]; bfa = r["bf_artifacts"]; bfe = r["bf_enchantments"]; bft = r["bf_total"]
         tkc = r["token_count"]; cp = r["combat_power"]; cd = r["cumul_damage"]
         gs = r["gy_size"]
+        opp_mill = r.get("opp_mill", {})
         rmc = r.get("removal_cast", {})
         rma = r.get("removal_available", {})
+        oml = r.get("opp_mill", {})
         draw_sources = r.get("draw_sources", [])
         combo_stats = r.get("combo_stats", [])
         w1 = r.get("win_turn_1opp"); w3 = r.get("win_turn_3opp")
@@ -8480,6 +11195,11 @@ class FasterFishing:
         # ═══════════════════════════════════════════════════════════
         # SECTION 1: MANA DEVELOPMENT
         # ═══════════════════════════════════════════════════════════
+        kt = r.get("kindred_type")
+        kc = r.get("kindred_count", 0)
+        if kt:
+            t.insert(tk.END, f"KINDRED DECK: {kt.title()} ({kc} creatures)\n\n", "good")
+
         t.insert(tk.END, "MANA DEVELOPMENT\n", "header")
         t.insert(tk.END, f"(Average across {nsims:,} games{combo_note})\n\n")
 
@@ -8536,6 +11256,38 @@ class FasterFishing:
             tag = "good" if cr >= 3 else "info"
             t.insert(tk.END, f"  {lb:>5s}  {cr:>9.1f}  {ar:>9.1f}  {en:>9.1f}  {ln:>6.1f}  {tk_ct:>7.1f}  {tot:>6.1f}\n", tag)
 
+        # ---- TOKEN TYPE BREAKDOWN ----
+        # Show which kinds of tokens the deck produces (only if any tokens exist)
+        tt_data = r.get("token_types", {})
+        # Collect all token types that appear across all turns
+        all_types = set()
+        for turn_data in tt_data.values():
+            for tk_name in turn_data:
+                all_types.add(tk_name)
+        if all_types:
+            # Find final turn count for sorting (show biggest producers first)
+            final_turn = max(tt_data.keys()) if tt_data else 0
+            final_counts = tt_data.get(final_turn, {})
+            sorted_types = sorted(all_types, key=lambda x: final_counts.get(x, 0), reverse=True)
+            # Only show types that produced >= 0.5 tokens by final turn
+            significant = [tp for tp in sorted_types if final_counts.get(tp, 0) >= 0.5]
+            if significant:
+                t.insert(tk.END, "\n")
+                t.insert(tk.END, "  TOKEN BREAKDOWN\n", "sub")
+                # Header
+                hdr_tok = f"  {'Type':<18s}"
+                display_turns = [tt for tt in range(1, nt + 1) if tt % 2 == 1 or tt == nt]
+                for dtt in display_turns:
+                    hdr_tok += f"  {'T'+str(dtt):>6s}"
+                t.insert(tk.END, hdr_tok + "\n", "info")
+                t.insert(tk.END, "  " + "-" * (18 + 8 * len(display_turns)) + "\n")
+                for tp in significant:
+                    row = f"  {tp:<18s}"
+                    for dtt in display_turns:
+                        val = tt_data.get(dtt, {}).get(tp, 0)
+                        row += f"  {val:>6.1f}"
+                    t.insert(tk.END, row + "\n", "info")
+
         # ═══════════════════════════════════════════════════════════
         # SECTION 4: DAMAGE CLOCK & WIN ESTIMATION
         # ═══════════════════════════════════════════════════════════
@@ -8558,17 +11310,65 @@ class FasterFishing:
             tag = "good" if cum >= 40 else "sub" if cum >= 20 else "info"
             t.insert(tk.END, f"  {lb:>5s}  {pw:>7.1f}  {tok:>7.1f}  {dmg_this:>8.1f}  {cum:>7.1f}  {bar}\n", tag)
 
+        # ---- MILL CLOCK (only shown if deck has mill sources) ----
+        max_mill = max(opp_mill.get(tt, 0) for tt in range(nt + 1)) if opp_mill else 0
+        if max_mill >= 1:
+            t.insert(tk.END, "\n")
+            t.insert(tk.END, "  MILL CLOCK\n", "sub")
+            t.insert(tk.END, "  (Cards milled from one opponent's library — 99 to deck out)\n\n")
+            hdr_mill = f"  {'Turn':>5s}  {'Mill/Turn':>9s}  {'Cumul':>7s}  {'Progress':>20s}"
+            t.insert(tk.END, hdr_mill + "\n", "info")
+            t.insert(tk.END, "  " + "-" * 50 + "\n")
+            prev_mill = 0
+            for turn in range(nt + 1):
+                lb = "Open" if turn == 0 else f"T{turn}"
+                mill_cum = opp_mill.get(turn, 0)
+                mill_this = mill_cum - prev_mill; prev_mill = mill_cum
+                pct99 = min(mill_cum / 99, 1.0) if mill_cum > 0 else 0
+                bar = "▓" * int(pct99 * 20) + "░" * (20 - int(pct99 * 20))
+                tag = "good" if mill_cum >= 99 else "sub" if mill_cum >= 50 else "info"
+                t.insert(tk.END, f"  {lb:>5s}  {mill_this:>9.1f}  {mill_cum:>7.1f}  {bar}\n", tag)
+
         # Win estimation
         t.insert(tk.END, "\n")
         t.insert(tk.END, "  WIN ESTIMATION\n", "sub")
+        kp1 = r.get("kill_pct_1opp", 0)
+        kp3 = r.get("kill_pct_3opp", 0)
         if w1 is not None:
-            t.insert(tk.END, f"    Kill 1 opponent (40 life):   ~Turn {w1}\n", "good")
+            # Check if commander damage is faster than 40 regular damage
+            avg_cd_40 = None
+            for tt in range(1, nt + 1):
+                if cd.get(tt, 0) >= 40:
+                    avg_cd_40 = tt; break
+            cmdr_note = ""
+            if avg_cd_40 is not None and isinstance(w1, float) and w1 < avg_cd_40:
+                cmdr_note = " (incl. commander 21)"
+            elif isinstance(w1, float):
+                cmdr_note = " (incl. commander 21)"
+            pct_str = f" ({kp1:.0f}% of games)" if kp1 < 99 else ""
+            t.insert(tk.END, f"    Kill 1 opponent:             ~Turn {w1}{cmdr_note}{pct_str}\n", "good")
         else:
-            t.insert(tk.END, f"    Kill 1 opponent (40 life):   Not reached in {nt} turns\n", "warn")
+            t.insert(tk.END, f"    Kill 1 opponent:             Not reached in {nt} turns\n", "warn")
         if w3 is not None:
-            t.insert(tk.END, f"    Kill all 3 opponents (120):  ~Turn {w3}\n", "good")
+            pct_str = f" ({kp3:.0f}% of games)" if kp3 < 99 else ""
+            t.insert(tk.END, f"    Kill all 3 opponents:        ~Turn {w3}{pct_str}\n", "good")
         else:
-            t.insert(tk.END, f"    Kill all 3 opponents (120):  Not reached in {nt} turns\n", "warn")
+            t.insert(tk.END, f"    Kill all 3 opponents:        Not reached in {nt} turns\n", "warn")
+
+        # Mill win estimation (only if deck has mill sources)
+        mw1 = r.get("mill_win_1opp"); mw3 = r.get("mill_win_3opp")
+        mp1 = r.get("mill_pct_1opp", 0); mp3 = r.get("mill_pct_3opp", 0)
+        if mw1 is not None or max_mill >= 10:
+            if mw1 is not None:
+                pct_str = f" ({mp1:.0f}% of games)" if mp1 < 99 else ""
+                t.insert(tk.END, f"    Mill 1 opponent (99 cards):   ~Turn {mw1}{pct_str}\n", "good")
+            elif max_mill >= 10:
+                t.insert(tk.END, f"    Mill 1 opponent (99 cards):   Not reached in {nt} turns ({max_mill:.0f} milled)\n", "warn")
+            if mw3 is not None:
+                pct_str = f" ({mp3:.0f}% of games)" if mp3 < 99 else ""
+                t.insert(tk.END, f"    Mill all 3 opponents (297):  ~Turn {mw3}{pct_str}\n", "good")
+            elif max_mill >= 30:
+                t.insert(tk.END, f"    Mill all 3 opponents (297):  Not reached in {nt} turns\n", "warn")
 
         # Combo win estimation
         if combo_stats:
@@ -8589,7 +11389,7 @@ class FasterFishing:
                 "demon_count": "Demon Win", "poison": "Poison/Infect",
                 "second_cast": "Second Casting", "instant_win": "Alt Win Condition",
                 "gate_count": "Maze's End", "five_color": "5-Color Win",
-                "type_count": "Tribal Win", "opponent_loses": "Opponent Loses",
+                "type_count": "Tribal Win", "opponent_loses": "Opponent Loses", "clone_copies": "Clone Win (Biovisionary)", "creature_names_combat": "Combat Names Win (Ramses)",
             }
             type_str = ", ".join(type_labels.get(wt, wt) for wt in alt_win["types"])
             t.insert(tk.END, f"    Alt win ({type_str}): ~Turn {alt_win['avg_turn']:.1f} "
@@ -8605,7 +11405,7 @@ class FasterFishing:
                 "demon_count": "Demon Win", "poison": "Poison/Infect",
                 "second_cast": "Second Casting", "instant_win": "Alt Win Condition",
                 "gate_count": "Maze's End", "five_color": "5-Color Win",
-                "type_count": "Tribal Win", "opponent_loses": "Opponent Loses",
+                "type_count": "Tribal Win", "opponent_loses": "Opponent Loses", "clone_copies": "Clone Win (Biovisionary)", "creature_names_combat": "Combat Names Win (Ramses)",
             }
             type_str = ", ".join(type_labels.get(wt, wt) for wt in alt_win["types"])
             t.insert(tk.END, f"    Alt win ({type_str}): Not achieved in {nt} turns\n", "warn")
@@ -8648,29 +11448,31 @@ class FasterFishing:
                 t.insert(tk.END, "  ⚠ Low removal density — consider adding more interaction\n", "warn")
 
         # ═══════════════════════════════════════════════════════════
-        # SECTION 6: DRAW SOURCES
+        # SECTION 6: CARD PRIORITY LIST
         # ═══════════════════════════════════════════════════════════
-        if draw_sources:
-            t.insert(tk.END, "\n")
-            t.insert(tk.END, "═" * 70 + "\n")
-            t.insert(tk.END, "DRAW SOURCES IN DECK\n", "header")
-            engines = [d for d in draw_sources if d["repeating"]]
-            one_shots = [d for d in draw_sources if not d["repeating"]]
-            if engines:
-                t.insert(tk.END, "\n  Draw Engines (repeating):\n", "info")
-                for d in sorted(engines, key=lambda x: x["draws"], reverse=True):
-                    lbl = f" [{d['label']}]" if d.get("label") else ""
-                    t.insert(tk.END, f"    {d['name']} (x{d['qty']}) — ~{d['draws']}/turn{lbl}\n", "good")
-            if one_shots:
-                t.insert(tk.END, f"\n  One-Shot ({len(one_shots)} cards):\n", "info")
-                for d in sorted(one_shots, key=lambda x: x["draws"], reverse=True)[:10]:
-                    lbl = f" [{d['label']}]" if d.get("label") else ""
-                    t.insert(tk.END, f"    {d['name']} (x{d['qty']}) — draws {d['draws']}{lbl}\n")
-                if len(one_shots) > 10:
-                    t.insert(tk.END, f"    ... and {len(one_shots) - 10} more\n", "info")
+        if hand_results:
+            primary_sz_prio = max(hand_results.keys())
+            primary_prio = hand_results[primary_sz_prio]
+            if hasattr(primary_prio, 'tutor_tracker') and primary_prio.tutor_tracker:
+                t.insert(tk.END, "\n")
+                t.insert(tk.END, "═" * 70 + "\n")
+                t.insert(tk.END, "CARD PRIORITY LIST\n", "header")
+                t.insert(tk.END, "(Average turn each priority card is seen or tutored)\n\n")
+                t.insert(tk.END, f"    {'Card':<30s}  {'Avg Turn':>9s}  {'Found %':>8s}\n", "info")
+                t.insert(tk.END, "    " + "-" * 52 + "\n")
+                for tname, data in sorted(primary_prio.tutor_tracker.items(),
+                                           key=lambda x: x[1]["avg_turn"] if x[1]["avg_turn"] >= 0 else 99):
+                    avg = data["avg_turn"]
+                    pct = data["found_pct"]
+                    if avg >= 0:
+                        tg = "good" if avg <= 5 else "warn" if avg <= 10 else "bad"
+                        t.insert(tk.END, f"    {tname:<30s}  {'T'+f'{avg:.1f}':>9s}  {pct:>7.1f}%\n", tg)
+                    else:
+                        t.insert(tk.END, f"    {tname:<30s}  {'never':>9s}  {pct:>7.1f}%\n", "bad")
+                t.insert(tk.END, "    (includes natural draws + tutor searches within 20 turns)\n", "info")
 
         # ═══════════════════════════════════════════════════════════
-        # SECTION 6: COMBO ASSEMBLY
+        # SECTION 7: COMBO ASSEMBLY
         # ═══════════════════════════════════════════════════════════
         if combo_stats:
             t.insert(tk.END, "\n")
@@ -8701,6 +11503,51 @@ class FasterFishing:
                 row += f"  {cs['found_pct']:>6.1f}%"
                 tag = "good" if cs["found_pct"] >= 50 else "sub" if cs["found_pct"] >= 20 else "info" if cs["found_pct"] > 0 else "warn"
                 t.insert(tk.END, row + "\n", tag)
+
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 8: CARD IMPACT RANKING
+        # ═══════════════════════════════════════════════════════════
+        card_impacts = r.get("card_impacts", [])
+        if card_impacts:
+            # Filter out lands (not interesting to rank) and separate commanders
+            non_land = [ci for ci in card_impacts if ci["category"] != "Land"]
+            if non_land:
+                t.insert(tk.END, "\n")
+                t.insert(tk.END, "═" * 70 + "\n")
+                t.insert(tk.END, "CARD IMPACT RANKING\n", "header")
+                t.insert(tk.END, "(Estimated goldfish value — higher = more impactful)\n\n")
+
+                # Top performers
+                top = [ci for ci in non_land if ci["score"] >= 3.0][:15]
+                if top:
+                    t.insert(tk.END, "  TOP PERFORMERS\n", "sub")
+                    t.insert(tk.END, f"    {'Card':<30s} {'Score':>6s}  {'CMC':>3s}  {'Why':>30s}\n", "info")
+                    t.insert(tk.END, "    " + "-" * 75 + "\n")
+                    for ci in top:
+                        name = ci["name"]
+                        if len(name) > 28: name = name[:25] + "..."
+                        cmdr_mark = " ★" if ci.get("is_commander") else ""
+                        tag_str = ", ".join(ci["tags"][:3]) if ci["tags"] else ci["category"]
+                        tag = "good" if ci["score"] >= 6 else "sub"
+                        t.insert(tk.END, f"    {name+cmdr_mark:<30s} {ci['score']:>6.1f}  {ci['cmc']:>3d}  {tag_str:>30s}\n", tag)
+
+                # Underperformers (potential cuts)
+                bottom = [ci for ci in non_land if ci["score"] <= 0 and ci["category"] != "Removal"]
+                if bottom:
+                    t.insert(tk.END, "\n  POTENTIAL CUTS (low goldfish value)\n", "sub")
+                    t.insert(tk.END, f"    {'Card':<30s} {'Score':>6s}  {'CMC':>3s}  {'Why':>30s}\n", "info")
+                    t.insert(tk.END, "    " + "-" * 75 + "\n")
+                    for ci in sorted(bottom, key=lambda x: x["score"])[:10]:
+                        name = ci["name"]
+                        if len(name) > 28: name = name[:25] + "..."
+                        tag_str = ", ".join(ci["tags"][:3]) if ci["tags"] else ci["category"]
+                        t.insert(tk.END, f"    {name:<30s} {ci['score']:>6.1f}  {ci['cmc']:>3d}  {tag_str:>30s}\n", "warn")
+                    t.insert(tk.END, "    (These cards do little in goldfish — consider for real-game interaction)\n", "info")
+
+                # Dead cards count
+                dead = [ci for ci in non_land if ci["score"] < 0]
+                if dead:
+                    t.insert(tk.END, f"\n    {len(dead)} card(s) have no goldfish value (counterspells, stax, disruption)\n", "info")
 
         # ═══════════════════════════════════════════════════════════
         # SECTION: OPENING HAND ANALYSIS (from sim_hands)
@@ -8790,22 +11637,6 @@ class FasterFishing:
                             tg = "good" if ab >= 25 else "warn" if ab >= 10 else "bad"
                             t.insert(tk.END, f"    {label:>14s}  {ab:>11.1f}%\n", tg)
                     t.insert(tk.END, "\n")
-
-            # Card priority tracker
-            if primary.tutor_tracker:
-                t.insert(tk.END, "  CARD PRIORITY LIST (avg turn seen or tutored)\n", "sub")
-                t.insert(tk.END, f"    {'Card':<30s}  {'Avg Turn':>9s}  {'Found %':>8s}\n", "info")
-                t.insert(tk.END, "    " + "-" * 52 + "\n")
-                for tname, data in sorted(primary.tutor_tracker.items(),
-                                           key=lambda x: x[1]["avg_turn"] if x[1]["avg_turn"] >= 0 else 99):
-                    avg = data["avg_turn"]
-                    pct = data["found_pct"]
-                    if avg >= 0:
-                        tg = "good" if avg <= 5 else "warn" if avg <= 10 else "bad"
-                        t.insert(tk.END, f"    {tname:<30s}  {'T'+f'{avg:.1f}':>9s}  {pct:>7.1f}%\n", tg)
-                    else:
-                        t.insert(tk.END, f"    {tname:<30s}  {'never':>9s}  {pct:>7.1f}%\n", "bad")
-                t.insert(tk.END, "    (includes natural draws + tutor searches within 20 turns)\n", "info")
 
         t.configure(state=tk.DISABLED)
         # Update land distribution chart from hand sim
