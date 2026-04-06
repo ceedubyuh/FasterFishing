@@ -1491,6 +1491,13 @@ class SimEngine:
                     # Rough estimate: power ~= CMC - 1 for most creatures
                     pw = max(1, int(c.cmc) - 1)
                 power_cache[c.name] = pw
+                # Transform/DFC: check if back face has higher power
+                if oracle and ("//" in oracle or "transform" in oracle):
+                    back_m = re.search(r'//.*?(\d+)/(\d+)', oracle, re.DOTALL)
+                    if back_m:
+                        back_pw = int(back_m.group(1))
+                        if back_pw > pw:
+                            power_cache[c.name] = back_pw
 
         # Pre-compute drain/ping effects: card_name -> (damage_per_trigger, trigger_type)
         # trigger_type: "death" (Blood Artist), "etb_creature" (Purphoros), "token" (Impact Tremors)
@@ -4067,14 +4074,34 @@ class SimEngine:
         adventure_cache = {}
         for c in all_copy_check:
             oracle = (c.oracle_text or "")
-            if " // " not in oracle:
+            oracle_l = oracle.lower()
+            # Adventure format: "Name {cost}\nType — Adventure\nEffect"
+            # OR: "Front // Name {cost}\nEffect" (Scryfall format)
+            # Key signal: "adventure" appears in the text
+            if "adventure" not in oracle_l:
                 continue
-            parts = oracle.split(" // ", 1)
-            adv_text = parts[1].lower()
-            if "adventure" not in adv_text:
+            # Extract adventure portion
+            adv_text = ""
+            if " // " in oracle:
+                adv_text = oracle.split(" // ", 1)[1].lower()
+            else:
+                # Newline-separated: find the adventure section
+                # Pattern: "CardName {cost}\n...Adventure\n...effect text"
+                lines = oracle_l.split("\n")
+                in_adventure = False
+                for line in lines:
+                    if "adventure" in line:
+                        in_adventure = True
+                        continue
+                    if in_adventure:
+                        adv_text += line + " "
+                if not adv_text:
+                    # Fallback: everything before first \n that contains the creature text
+                    adv_text = oracle_l
+            if not adv_text.strip():
                 continue
-            # Parse adventure cost
-            m_cost = re.search(r'\{[^}]+\}(?:\{[^}]+\})*', parts[1])
+            # Parse adventure cost from the card's adventure name line
+            m_cost = re.search(r'\{[^}]+\}(?:\{[^}]+\})*', oracle)
             adv_cmc = 0
             if m_cost:
                 for p in re.findall(r'\{([^}]+)\}', m_cost.group(0)):
@@ -9192,25 +9219,6 @@ class SimEngine:
                     score += 3
                     tags.append("partner (two commanders)")
 
-            # Adventure: spell half provides value before creature enters
-            if re.search(r'adventure', (c.type_line or '').lower()):
-                # Type line contains "Adventure" for adventure cards
-                score += 2
-                tags.append("adventure (two spells in one)")
-            elif re.search(r'^[A-Z][\w\s]+\{.*?\}:', oracle_ci):
-                # Adventure pattern in oracle: "Name {cost}: effect" at start
-                adv_text = oracle_ci.split('\n')[0] if '\n' in oracle_ci else ''
-                if re.search(r'\{.*?\}.*?:', adv_text) and len(adv_text) < 100:
-                    score += 1.5
-                    if 'destroy' in adv_text or 'exile' in adv_text or 'damage' in adv_text:
-                        score += 1
-                        tags.append("adventure (removal + creature)")
-                    elif 'draw' in adv_text:
-                        score += 1
-                        tags.append("adventure (draw + creature)")
-                    else:
-                        tags.append("adventure (two modes)")
-
             # Channel lands: removal/utility from a land slot
             if c.category == "Land" and "channel" in oracle_ci:
                 score += 3  # free spell from a land slot is very efficient
@@ -9224,6 +9232,62 @@ class SimEngine:
                     tags.append("channel (token from land slot)")
                 else:
                     tags.append("channel (utility land)")
+
+            # Sacrifice outlets: enable aristocrats engines
+            if c.name in sac_outlet_cache:
+                eff, ep = sac_outlet_cache[c.name]
+                if eff == "draw":
+                    score += 4
+                    tags.append("sac outlet (draw)")
+                elif eff == "damage":
+                    score += 3
+                    tags.append(f"sac outlet ({ep} damage)")
+                elif eff == "mana":
+                    score += 3
+                    tags.append("sac outlet (mana)")
+                else:
+                    score += 2
+                    tags.append("sac outlet (free)")
+
+            # Death triggers: Blood Artist, Zulaport Cutthroat, etc.
+            if re.search(r'whenever\s+(?:a|another)\s+creature\s+(?:you\s+control\s+)?dies', oracle_ci):
+                if re.search(r'(?:lose|loses)\s+\d+\s+life|deals?\s+\d+\s+damage|drain', oracle_ci):
+                    score += 3
+                    tags.append("death trigger (drain)")
+                elif 'draw' in oracle_ci:
+                    score += 3
+                    tags.append("death trigger (draw)")
+                elif 'token' in oracle_ci or 'create' in oracle_ci:
+                    score += 2
+                    tags.append("death trigger (tokens)")
+
+            # Reanimation spells
+            if c.name in reanimate_spell_cache:
+                reanimate_cost = reanimate_spell_cache[c.name]
+                score += max(5 - reanimate_cost, 1)  # cheaper reanimate = better
+                tags.append(f"reanimation (CMC {reanimate_cost})")
+
+            # Adventure: two spells in one card
+            if c.name in adventure_cache:
+                adv_cmc, adv_eff, adv_param = adventure_cache[c.name]
+                score += 2
+                if adv_eff == "removal":
+                    score += 1.5
+                    tags.append(f"adventure: removal ({adv_cmc}) + creature")
+                elif adv_eff == "draw":
+                    score += 1
+                    tags.append(f"adventure: draw {adv_param} ({adv_cmc}) + creature")
+                elif adv_eff == "damage":
+                    score += 0.5
+                    tags.append(f"adventure: {adv_param} damage ({adv_cmc}) + creature")
+                elif adv_eff == "ramp":
+                    score += 1
+                    tags.append(f"adventure: ramp ({adv_cmc}) + creature")
+                elif adv_eff == "token":
+                    score += 0.5
+                    tags.append(f"adventure: token ({adv_cmc}) + creature")
+                else:
+                    tags.append(f"adventure: utility ({adv_cmc}) + creature")
 
             # Kindred doublers / spell copiers / trigger doublers
             if "instant" not in tl_ci and "sorcery" not in tl_ci:
@@ -13012,6 +13076,144 @@ class FasterFishing:
             if n_lands < rec_lands - 3:
                 issues.append(f"Land count ({n_lands}) is well below recommended ({rec_lands}) for CMC {cmdr_cmc}")
 
+            # ── AVERAGE CMC (non-land cards) ──
+            non_land_cards = [c for c in deck_cards if c.category != "Land"]
+            total_cmc = sum(int(c.cmc) * c.quantity for c in non_land_cards if c.cmc)
+            total_non_land = sum(c.quantity for c in non_land_cards)
+            avg_cmc = total_cmc / max(total_non_land, 1)
+
+            # ── MANA CURVE DISTRIBUTION ──
+            curve = {}  # cmc -> count
+            for c in non_land_cards:
+                cmc_c = min(int(c.cmc) if c.cmc else 0, 8)  # cap at 8+
+                curve[cmc_c] = curve.get(cmc_c, 0) + c.quantity
+            # Detect curve gaps (missing CMC slots below commander CMC)
+            curve_gaps = []
+            for mv in range(1, min(cmdr_cmc + 1, 7)):
+                if curve.get(mv, 0) == 0:
+                    curve_gaps.append(mv)
+            # Detect heavy clumps (>20% of non-lands at one CMC)
+            curve_clumps = []
+            for mv, count in curve.items():
+                if count > total_non_land * 0.25 and mv > 0:
+                    curve_clumps.append((mv, count))
+
+            # ── INTERACTION COUNT ──
+            n_interaction = 0
+            n_removal = 0
+            n_counterspell = 0
+            n_protection = 0
+            for c in deck_cards:
+                cat = c.category
+                if cat == "Removal":
+                    n_removal += c.quantity
+                    n_interaction += c.quantity
+                elif cat == "Protection":
+                    n_protection += c.quantity
+                    n_interaction += c.quantity
+                else:
+                    oracle = (c.oracle_text or "").lower()
+                    if re.search(r'counter\s+target\s+(?:spell|creature|noncreature|artifact|enchantment)', oracle):
+                        n_counterspell += c.quantity
+                        n_interaction += c.quantity
+                    elif re.search(r'(?:destroy|exile)\s+target\s+(?:creature|permanent|artifact|enchantment|nonland)', oracle):
+                        n_removal += c.quantity
+                        n_interaction += c.quantity
+            rec_interaction = 10  # widely recommended minimum
+
+            # ── WIN CONDITION DETECTION ──
+            win_paths = []
+            has_combat = sum(c.quantity for c in deck_cards
+                            if "creature" in (c.type_line or "").lower()) >= 10
+            has_combo = False  # we detect combos in the combo finder
+            has_mill = any("mill" in (c.oracle_text or "").lower() and c.category != "Land"
+                          for c in deck_cards)
+            has_voltron = sum(c.quantity for c in deck_cards
+                            if "equipment" in (c.type_line or "").lower()
+                            or ("aura" in (c.type_line or "").lower()
+                                and "enchanted creature gets" in (c.oracle_text or "").lower())) >= 8
+            has_aristocrats = sum(1 for c in deck_cards
+                                if re.search(r'(?:sacrifice|whenever.*dies)', (c.oracle_text or "").lower())
+                                and c.category != "Land") >= 5
+            has_tokens = sum(1 for c in deck_cards
+                           if "token" in (c.oracle_text or "").lower()
+                           and c.category != "Land") >= 8
+            has_storm = any("storm" in (c.oracle_text or "").lower() for c in deck_cards
+                          if c.category != "Land")
+
+            if has_combat: win_paths.append("Combat")
+            if has_voltron: win_paths.append("Voltron")
+            if has_mill: win_paths.append("Mill")
+            if has_aristocrats: win_paths.append("Aristocrats")
+            if has_tokens: win_paths.append("Tokens/Go-wide")
+            if has_storm: win_paths.append("Storm")
+
+            # ── ADD ISSUES ──
+            if n_interaction < 5:
+                issues.append(f"CRITICAL: Only {n_interaction} interaction pieces — deck can't answer threats")
+            elif n_interaction < rec_interaction - 3:
+                issues.append(f"Interaction count ({n_interaction}) is below recommended ({rec_interaction})")
+
+            if not win_paths:
+                issues.append("No clear win condition detected — deck may struggle to close games")
+
+            if curve_gaps:
+                gaps_str = ", ".join(str(g) for g in curve_gaps)
+                issues.append(f"Mana curve gap at CMC {gaps_str} — may have awkward turns")
+
+            if avg_cmc > 3.5:
+                issues.append(f"Average CMC {avg_cmc:.1f} is high — deck may be slow to develop")
+
+            # ── KARSTEN MANA BASE CHECK ──
+            # Quick check: does the mana base support the color demands?
+            KARSTEN_99 = {
+                1: {1: 15}, 2: {1: 13, 2: 21}, 3: {1: 10, 2: 18, 3: 27},
+                4: {1: 9, 2: 15, 3: 23}, 5: {1: 8, 2: 13, 3: 19},
+                6: {1: 7, 2: 11, 3: 17}, 7: {1: 7, 2: 10, 3: 15},
+            }
+            color_names = {'W': 'White', 'U': 'Blue', 'B': 'Black', 'R': 'Red', 'G': 'Green'}
+            color_demand = {}
+            for c in deck_cards:
+                if c.category == "Land":
+                    continue
+                reqs = SimEngine._parse_color_requirements(c.mana_cost)
+                if not reqs:
+                    continue
+                cmc_k = min(max(1, int(c.cmc)), 7)
+                for color, pips in reqs.items():
+                    if color not in 'WUBRG':
+                        continue
+                    pips_k = min(pips, 3)
+                    if cmc_k in KARSTEN_99 and pips_k in KARSTEN_99[cmc_k]:
+                        needed = KARSTEN_99[cmc_k][pips_k]
+                        if color not in color_demand or needed > color_demand[color][0]:
+                            color_demand[color] = (needed, c.name)
+
+            # Count color sources
+            color_sources = {}
+            for c in deck_cards:
+                if c.category not in ("Land", "Ramp"):
+                    continue
+                cp = SimEngine._parse_color_production(c)
+                for col in cp:
+                    if col == 'any':
+                        for ac in 'WUBRG':
+                            color_sources[ac] = color_sources.get(ac, 0) + c.quantity * 0.8
+                    elif col in 'WUBRG':
+                        color_sources[col] = color_sources.get(col, 0) + c.quantity
+
+            karsten_shortfalls = []
+            for col, (needed, card_name) in color_demand.items():
+                have = color_sources.get(col, 0)
+                if have < needed - 3:
+                    karsten_shortfalls.append((col, needed, have, card_name))
+
+            if karsten_shortfalls:
+                for col, needed, have, card_name in karsten_shortfalls:
+                    deficit = needed - int(have)
+                    issues.append(f"CRITICAL: {color_names[col]} sources ({int(have)}) short by {deficit} — can't reliably cast {card_name}")
+
+            # Recompute grade with new issues
             n_criticals = sum(1 for i in issues if "CRITICAL" in i)
             if n_criticals == 0 and len(issues) <= 1:
                 grade = "A" if len(issues) == 0 else "B"
@@ -13034,6 +13236,16 @@ class FasterFishing:
                 "draw_failure_risk": draw_failure_risk,
                 "ramp_effective_value": round(ramp_effective, 1),
                 "draw_effective_value": round(draw_effective, 1),
+                "avg_cmc": round(avg_cmc, 2),
+                "curve": curve,
+                "curve_gaps": curve_gaps,
+                "curve_clumps": curve_clumps,
+                "n_interaction": n_interaction,
+                "n_removal": n_removal,
+                "n_counterspell": n_counterspell,
+                "n_protection": n_protection,
+                "rec_interaction": rec_interaction,
+                "win_paths": win_paths,
                 "grade": grade, "issues": issues,
                 "avg_lands_t3": round(avg_lands_t3, 1),
                 "avg_mana_at_threshold": round(avg_mana_threshold, 1),
@@ -13099,8 +13311,72 @@ class FasterFishing:
 
             rev = dh.get("ramp_effective_value", 0)
             dev = dh.get("draw_effective_value", 0)
-            t.insert(tk.END, f"\n  Effective Value:  Ramp={rev:.1f}  Draw={dev:.1f}  Total={rev+dev:.1f}\n", "info")
+            avg_cmc = dh.get("avg_cmc", 0)
+            t.insert(tk.END, f"\n  Average CMC: {avg_cmc:.2f}    ", "info")
+            t.insert(tk.END, f"Effective Value: Ramp={rev:.1f}  Draw={dev:.1f}  Total={rev+dev:.1f}\n", "info")
             t.insert(tk.END, f"  (1.0 value unit = one extra card + one extra land = full time walk)\n", "info")
+
+            # Mana curve distribution — vertical bar chart
+            curve = dh.get("curve", {})
+            if curve:
+                t.insert(tk.END, f"\n  Mana Curve:\n", "sub")
+                max_count = max(curve.values()) if curve else 1
+                max_bar_height = 10  # rows tall
+                # Build columns: CMC 0-7, 8+
+                cols = []
+                for mv in range(0, 9):
+                    count = curve.get(mv, 0)
+                    cols.append((f"{mv}" if mv < 8 else "8+", count))
+
+                # Draw rows top-down
+                for row in range(max_bar_height, 0, -1):
+                    threshold = row / max_bar_height * max_count
+                    line = "    "
+                    for label, count in cols:
+                        if count >= threshold and count > 0:
+                            line += " ██ "
+                        else:
+                            line += "    "
+                    t.insert(tk.END, line + "\n", "good")
+
+                # Labels row
+                label_line = "    "
+                for label, count in cols:
+                    label_line += f" {label:^2s} "
+                t.insert(tk.END, label_line + "\n", "info")
+
+                # Count row
+                count_line = "    "
+                for label, count in cols:
+                    count_line += f" {count:^2d} " if count < 100 else f"{count:^4d}"
+                t.insert(tk.END, count_line + "\n", "info")
+
+                curve_gaps = dh.get("curve_gaps", [])
+                curve_clumps = dh.get("curve_clumps", [])
+                if curve_gaps:
+                    t.insert(tk.END, f"  ⚠ Curve gaps at CMC: {', '.join(str(g) for g in curve_gaps)}\n", "warn")
+                if curve_clumps:
+                    for mv, count in curve_clumps:
+                        t.insert(tk.END, f"  ⚠ Heavy clump at CMC {mv}: {count} cards ({count*100//max(sum(c.quantity for c in deck_cards if c.category!='Land'),1)}%)\n", "warn")
+
+            # Interaction
+            n_int = dh.get("n_interaction", 0)
+            n_rem = dh.get("n_removal", 0)
+            n_ctr = dh.get("n_counterspell", 0)
+            n_prot = dh.get("n_protection", 0)
+            rec_int = dh.get("rec_interaction", 10)
+            t.insert(tk.END, f"\n  Interaction: {n_int} pieces", "sub")
+            int_tag = "good" if n_int >= rec_int else "warn" if n_int >= rec_int - 3 else "bad"
+            t.insert(tk.END, f" (recommended ~{rec_int})\n", int_tag)
+            t.insert(tk.END, f"    Removal: {n_rem}  Counterspells: {n_ctr}  Protection: {n_prot}\n", "info")
+
+            # Win conditions
+            win_paths = dh.get("win_paths", [])
+            t.insert(tk.END, f"\n  Win Conditions: ", "sub")
+            if win_paths:
+                t.insert(tk.END, f"{', '.join(win_paths)}\n", "good")
+            else:
+                t.insert(tk.END, "None detected\n", "bad")
 
             t.insert(tk.END, f"\n  Failure Mode Analysis:\n", "sub")
             for label, risk_key, desc in [
