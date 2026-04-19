@@ -51,6 +51,7 @@
          exceeds the sum of their individual impacts (superadditive = true synergy).
 
 ---- SMART GOLDFISH CASTING PRIORITIES ----
+
 These model a competent Commander player's decision-making:
 
  CAST PROBABILITIES (simulates a goldfish with no opponents to interact with):
@@ -78,8 +79,6 @@ These model a competent Commander player's decision-making:
    * "discard":  T1-3: 15%, T4-6: 20%, T7-9: 25%, T10+: 25%
    * "redirect": T1-3: 5%, T4-6: 10%, T7-9: 20%, T10+: 30%
    * "stax":     T1-3: 10%, T4-6: 15%, T7-9: 20%, T10+: 20%
-
-
 
 * Sample hand viewer
   * Displays opening hands with card images
