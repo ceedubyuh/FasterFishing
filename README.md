@@ -22,7 +22,8 @@
     * Removal
     * Board wipes
     * Creatures
-    * (more refinement to come)
+    * Equipment
+    * Tutors
 
 * Opening hand simulations
   * Monte Carlo hand analysis
@@ -36,8 +37,16 @@
   * Estimates average commander cast turn
   * Estimates average board state per turn
   * Estimates average damage presented on board and what turn you can go for a win on
-  * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw, tutors and graveyard recursion
+  * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw and tutors
   * Estimates the average turn you can execute any combos your deck includes
+  * Performs a per-card win contribution measurement to estimate how good a singular card is in your deck using a Leave One Out strategy
+      *  Causal measurement: for each unique non-land card, remove it from the deck
+         and re-sim to measure actual impact on kill turn. This naturally captures:
+           * Combo synergy (removing a combo piece drops combo assembly rate)
+           * Draw chain value (removing a draw engine means fewer cards seen → slower kills)
+           * Ramp contribution (removing ramp delays commander and bombs)
+         After LOO, detect synergy pairs: cards whose combined removal impact
+         exceeds the sum of their individual impacts (superadditive = true synergy).
 
 * Sample hand viewer
   * Displays opening hands with card images
