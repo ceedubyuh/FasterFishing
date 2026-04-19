@@ -272,36 +272,55 @@ class DeckParser:
         # Browser-like headers to avoid Cloudflare blocks
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",
             "Referer": "https://www.moxfield.com/",
             "Origin": "https://www.moxfield.com",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-site",
+            "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
         }
+
+        errors = []  # collect error info from each attempt
 
         # Attempt 1: Direct request with browser headers
         try:
             r = requests.get(api_url, headers=headers, timeout=15)
             if r.status_code == 200:
                 return DeckParser._parse_moxfield_json(r.json())
-        except Exception:
-            pass
+            else:
+                errors.append(f"Direct API: HTTP {r.status_code}")
+                try:
+                    errors.append(f"  Response: {r.text[:300]}")
+                except Exception:
+                    errors.append(f"  Response: (could not decode, {len(r.content)} bytes)")
+        except Exception as e:
+            errors.append(f"Direct API: {type(e).__name__}: {e}")
 
         # Attempt 2: Try with cloudscraper if available (handles Cloudflare JS challenges)
         try:
             import cloudscraper
-            scraper = cloudscraper.create_scraper()
-            r = scraper.get(api_url, headers=headers, timeout=15)
+            scraper = cloudscraper.create_scraper(
+                browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+            )
+            r = scraper.get(api_url, timeout=15)
             if r.status_code == 200:
                 return DeckParser._parse_moxfield_json(r.json())
+            else:
+                errors.append(f"Cloudscraper: HTTP {r.status_code}")
+                try:
+                    errors.append(f"  Response: {r.text[:300]}")
+                except Exception:
+                    errors.append(f"  Response: (could not decode)")
         except ImportError:
-            pass  # cloudscraper not installed
-        except Exception:
-            pass
+            errors.append("Cloudscraper: not installed (pip install cloudscraper)")
+        except Exception as e:
+            errors.append(f"Cloudscraper: {type(e).__name__}: {e}")
 
         # Attempt 3: Try fetching the HTML page and look for embedded JSON data
         try:
@@ -318,8 +337,19 @@ class DeckParser:
                     deck = props.get("deck", props)
                     if "mainboard" in deck or "commanders" in deck:
                         return DeckParser._parse_moxfield_json(deck)
-        except Exception:
-            pass
+                    else:
+                        errors.append("HTML parse: __NEXT_DATA__ found but no deck data in it")
+                else:
+                    errors.append("HTML parse: no __NEXT_DATA__ script tag found")
+            else:
+                errors.append(f"HTML page: HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"HTML page: {type(e).__name__}: {e}")
+
+        # Log all errors for debugging
+        print(f"[Moxfield Import] All attempts failed for deck {deck_id}:")
+        for err in errors:
+            print(f"  {err}")
 
         return "__MOXFIELD_BLOCKED__"
 
