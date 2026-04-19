@@ -36,7 +36,8 @@
   * Tracks resource development
   * Estimates average commander cast turn
   * Estimates average board state per turn
-  * Estimates average damage presented on board and what turn you can go for a win on
+  * Estimates average damage presented on board and what turn you can go for a win
+      * Detects alternate wincons like empty libraries, creature count, life total etc. and the average turn you will execute those conditions
   * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw and tutors
   * Estimates the average turn you can execute any combos your deck includes\
   * Comprehensive Trigger Chain system to keep track of your triggers 
