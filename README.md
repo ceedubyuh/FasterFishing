@@ -49,7 +49,8 @@
            * Ramp contribution (removing ramp delays commander and bombs)
          After LOO, detect synergy pairs: cards whose combined removal impact
          exceeds the sum of their individual impacts (superadditive = true synergy).
- ---- SMART GOLDFISH CASTING PRIORITIES ----
+
+---- SMART GOLDFISH CASTING PRIORITIES ----
 These model a competent Commander player's decision-making:
 
  CAST PROBABILITIES (simulates a goldfish with no opponents to interact with):
@@ -68,6 +69,7 @@ These model a competent Commander player's decision-making:
    * Graveyard zone tracked for recursion decks
  
  ---- INTERACTION CARD DETECTION ----
+ 
  Cards whose primary effect targets opponents (removal, counters, discard).
  In goldfish these have no target, but we simulate casting them on a
  turn-scaling probability curve to model realistic hand/mana usage.
