@@ -54,12 +54,12 @@
 These model a competent Commander player's decision-making:
 
  CAST PROBABILITIES (simulates a goldfish with no opponents to interact with):
-   Ramp:      100% early (turns 1-4), 60% late (turns 5+, diminishing returns)
-   Draw:      100% always (card advantage is king)
-   Tutor:     85% (sometimes you hold for the right moment)
-   Board:     90% (creatures, enchantments, artifacts — your main plan)
-   Protection: 25% (counterspells/hexproof pieces — minimal value in goldfish)
-   Combo:     95% (always want these in play if you can)
+   * Ramp:      100% early (turns 1-4), 60% late (turns 5+, diminishing returns)
+   * Draw:      100% always (card advantage is king)
+   * Tutor:     85% (sometimes you hold for the right moment)
+   * Board:     90% (creatures, enchantments, artifacts — your main plan)
+   * Protection: 25% (counterspells/hexproof pieces — minimal value in goldfish)
+   * Combo:     95% (always want these in play if you can)
 
  ADDITIONAL INTELLIGENCE:
    * Extra land drops detected from oracle text (Exploration, Azusa)
@@ -70,16 +70,14 @@ These model a competent Commander player's decision-making:
  
  ---- INTERACTION CARD DETECTION ----
  
- Cards whose primary effect targets opponents (removal, counters, discard).
- In goldfish these have no target, but we simulate casting them on a
- turn-scaling probability curve to model realistic hand/mana usage.
- interaction_curve: card_name -> curve_type
- Interaction types and their per-turn cast probability:
-   "counter":  T1-3: 5%, T4-6: 15%, T7-9: 30%, T10+: 40%
-   "removal":  T1-3: 10%, T4-6: 25%, T7-9: 40%, T10+: 50%
-   "discard":  T1-3: 15%, T4-6: 20%, T7-9: 25%, T10+: 25%
-   "redirect": T1-3: 5%, T4-6: 10%, T7-9: 20%, T10+: 30%
-   "stax":     T1-3: 10%, T4-6: 15%, T7-9: 20%, T10+: 20%
+ Cards whose primary effect targets opponents (removal, counters, discard). In goldfish these have no target, but we simulate casting them on a turn-scaling probability curve to model realistic hand/mana usage.
+ * interaction_curve: card_name -> curve_type
+ * Interaction types and their per-turn cast probability:
+   * "counter":  T1-3: 5%, T4-6: 15%, T7-9: 30%, T10+: 40%
+   * "removal":  T1-3: 10%, T4-6: 25%, T7-9: 40%, T10+: 50%
+   * "discard":  T1-3: 15%, T4-6: 20%, T7-9: 25%, T10+: 25%
+   * "redirect": T1-3: 5%, T4-6: 10%, T7-9: 20%, T10+: 30%
+   * "stax":     T1-3: 10%, T4-6: 15%, T7-9: 20%, T10+: 20%
 
 
 
