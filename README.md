@@ -38,7 +38,8 @@
   * Estimates average board state per turn
   * Estimates average damage presented on board and what turn you can go for a win on
   * Estimates the amount of cards you can see based on your repeatable card draw, regular card draw and tutors
-  * Estimates the average turn you can execute any combos your deck includes
+  * Estimates the average turn you can execute any combos your deck includes\
+  * Comprehensive Trigger Chain system to keep track of your triggers 
   * Performs a per-card win contribution measurement to estimate how good a singular card is in your deck using a Leave One Out strategy
       *  Causal measurement: for each unique non-land card, remove it from the deck
          and re-sim to measure actual impact on kill turn. This naturally captures:
